@@ -248,7 +248,7 @@ def get_github_token():
     return st.secrets.get("github_token") or os.environ.get("GITHUB_TOKEN")
 
 
-def parse_free_text_rule(text: str) -> Dict:
+def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
     if genai is None:
         raise RuntimeError("Google GenAI client not available. Install google-genai.")
     api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -312,6 +312,10 @@ def parse_free_text_rule(text: str) -> Dict:
         "required": ["inputs", "rules", "scoring_rules"],
     }
 
+    scoring_line = (
+        "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
+        "If scoring_mode is 'signed', you may use both favor_values and against_values."
+    )
     system_prompt = (
         "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
         "Always return valid JSON matching the schema. "
@@ -319,12 +323,13 @@ def parse_free_text_rule(text: str) -> Dict:
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
         "Return multiple recommendation rules when the text describes alternatives or exceptions. "
-        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list."
+        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
+        + scoring_line
     )
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[system_prompt, text],
+        contents=[f"{system_prompt}\nscoring_mode={scoring_mode}", text],
         config={
             "response_mime_type": "application/json",
             "response_json_schema": json_schema,
@@ -714,20 +719,26 @@ def render_message(level, message):
 
 
 def evaluate_rules(tool, values):
+    best_match = None
+    best_count = 0
     for rule in tool.get("rules", []):
         conditions = rule.get("conditions", [])
         if not conditions:
             continue
-        matches = True
+        matched = 0
         for cond in conditions:
             input_id = cond.get("input_id")
             expected = cond.get("value")
             actual = values.get(input_id)
-            if actual != expected:
-                matches = False
-                break
-        if matches:
-            return rule.get("level", "info"), rule.get("message", "")
+            if actual == expected:
+                matched += 1
+        if matched > best_count:
+            best_count = matched
+            best_match = rule
+
+    if best_match and best_count > 0:
+        return best_match.get("level", "info"), best_match.get("message", "")
+
     fallback = tool.get("fallback", {"level": "warning", "message": "No rules matched."})
     return fallback.get("level", "warning"), fallback.get("message", "No rules matched.")
 
@@ -735,6 +746,7 @@ def evaluate_rules(tool, values):
 def compute_scores(tool, values):
     plus = 0
     minus = 0
+    scoring_mode = tool.get("scoring_mode", "signed")
     for rule in tool.get("scoring_rules", []):
         input_id = rule.get("input_id")
         if not input_id:
@@ -751,7 +763,7 @@ def compute_scores(tool, values):
             score = 1 if invert else -1
         if score == 1:
             plus += weight
-        elif score == -1:
+        elif score == -1 and scoring_mode == "signed":
             minus += weight
     return plus, minus
 
@@ -819,6 +831,13 @@ def main():
         st.subheader("Tool Details")
         tool["name"] = st.text_input("Tool name", value=tool.get("name", ""))
         tool["description"] = st.text_area("Description", value=tool.get("description", ""))
+        scoring_mode = st.selectbox(
+            "Scoring mode",
+            ["signed", "positive-only"],
+            index=["signed", "positive-only"].index(tool.get("scoring_mode", "signed")),
+            format_func=lambda x: "Signed (favor + / against -)" if x == "signed" else "Positive-only (no negatives)",
+        )
+        tool["scoring_mode"] = scoring_mode
 
         st.divider()
         st.subheader("Free-Text Rule Builder (AI)")
@@ -829,9 +848,15 @@ def main():
             key="free_text_rule",
             height=120,
         )
+        scoring_hint = st.selectbox(
+            "Scoring style for AI parser",
+            ["signed", "positive-only"],
+            index=["signed", "positive-only"].index(tool.get("scoring_mode", "signed")),
+            format_func=lambda x: "Signed (favor + / against -)" if x == "signed" else "Positive-only (no negatives)",
+        )
         if st.button("Parse with AI"):
             try:
-                parsed = parse_free_text_rule(free_text)
+                parsed = parse_free_text_rule(free_text, scoring_hint)
                 tool = merge_ai_result(tool, parsed)
                 st.session_state.editing_tool = tool
                 st.success("AI rule added. Review below.")
@@ -1122,4 +1147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
