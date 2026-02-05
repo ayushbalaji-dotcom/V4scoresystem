@@ -349,6 +349,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
         "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
         "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
+        "If the text includes a class label (e.g., Class I, Class IIa, Class 1B), include that phrase in the rule message (and optionally the rule name). "
         + scoring_line
     )
 
