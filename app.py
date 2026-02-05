@@ -308,8 +308,31 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                     "required": ["label", "favor_values", "against_values", "invert_favor", "weight"],
                 },
             },
+            "scoring_recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "min_score": {"type": "integer"},
+                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
+                        "message": {"type": "string"},
+                        "conditions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["label", "value"],
+                            },
+                        },
+                    },
+                    "required": ["min_score", "level", "message", "conditions"],
+                },
+            },
         },
-        "required": ["inputs", "rules", "scoring_rules"],
+        "required": ["inputs", "rules", "scoring_rules", "scoring_recommendations"],
     }
 
     scoring_line = (
@@ -324,6 +347,8 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
         "Return multiple recommendation rules when the text describes alternatives or exceptions. "
         "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
+        "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
+        "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
         + scoring_line
     )
 
@@ -574,6 +599,29 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
         )
     tool["scoring_rules"] = scoring_rules
 
+    scoring_recs = tool.get("scoring_recommendations", [])
+    for item in parsed.get("scoring_recommendations", []):
+        conditions = []
+        for cond in item.get("conditions", []):
+            label = questionize_label(cond.get("label"))
+            value = safe_str(cond.get("value"))
+            input_id = label_to_id.get(label)
+            if input_id and value:
+                conditions.append({"input_id": input_id, "op": "equals", "value": value})
+        try:
+            min_score = int(item.get("min_score"))
+        except (TypeError, ValueError):
+            continue
+        scoring_recs.append(
+            {
+                "min_score": min_score,
+                "level": item.get("level", "info"),
+                "message": safe_str(item.get("message")),
+                "conditions": conditions,
+            }
+        )
+    tool["scoring_recommendations"] = scoring_recs
+
     return tool
 
 def tool_to_input_rows(tool):
@@ -772,7 +820,7 @@ def compute_scores(tool, values):
     return plus, minus, total
 
 
-def evaluate_score_recommendation(tool, total_score):
+def evaluate_score_recommendation(tool, values, total_score):
     thresholds = tool.get("scoring_recommendations", [])
     if not thresholds:
         return None
@@ -783,12 +831,31 @@ def evaluate_score_recommendation(tool, total_score):
         except (TypeError, ValueError):
             continue
         if total_score >= min_score:
-            if best is None or min_score > best.get("min_score", -10**9):
-                best = {
-                    "min_score": min_score,
-                    "level": item.get("level", "info"),
-                    "message": item.get("message", ""),
-                }
+            conditions = item.get("conditions", [])
+            matched = 0
+            for cond in conditions:
+                input_id = cond.get("input_id")
+                expected = cond.get("value")
+                actual = values.get(input_id)
+                if actual == expected:
+                    matched += 1
+            if conditions and matched != len(conditions):
+                continue
+            ratio = matched / len(conditions) if conditions else 1.0
+            candidate = {
+                "min_score": min_score,
+                "level": item.get("level", "info"),
+                "message": item.get("message", ""),
+                "matched": matched,
+                "ratio": ratio,
+            }
+            if best is None:
+                best = candidate
+            else:
+                if min_score > best.get("min_score", -10**9):
+                    best = candidate
+                elif min_score == best.get("min_score", -10**9) and ratio > best.get("ratio", 0.0):
+                    best = candidate
     return best
 
 
@@ -1139,11 +1206,63 @@ def main():
                     st.session_state.editing_tool = tool
                     st.rerun()
 
+            conditions = item.get("conditions", [])
+            if st.button("Add Condition", key=f"score_add_cond_{sidx}"):
+                conditions.append({"input_id": "", "op": "equals", "value": ""})
+                item["conditions"] = conditions
+                tool["scoring_recommendations"] = scoring_recs
+                st.session_state.editing_tool = tool
+                st.rerun()
+
+            updated_conditions = []
+            for cidx, cond in enumerate(conditions):
+                ccol1, ccol2, ccol3 = st.columns([3, 3, 1])
+                with ccol1:
+                    if label_options:
+                        cond_label = id_to_label.get(cond.get("input_id", ""), "")
+                        cond_label = st.selectbox(
+                            "Input",
+                            options=label_options,
+                            index=label_options.index(cond_label) if cond_label in label_options else 0,
+                            key=f"score_cond_input_{sidx}_{cidx}",
+                        )
+                        cond_input_id = label_to_id.get(cond_label, "")
+                    else:
+                        st.warning("Add inputs first.")
+                        cond_input_id = ""
+                with ccol2:
+                    options = get_input_options(tool["inputs"], cond_input_id)
+                    if options:
+                        cond_value = st.selectbox(
+                            "Value",
+                            options=options,
+                            index=options.index(cond.get("value")) if cond.get("value") in options else 0,
+                            key=f"score_cond_value_{sidx}_{cidx}",
+                        )
+                    else:
+                        cond_value = st.text_input(
+                            "Value",
+                            value=safe_str(cond.get("value")),
+                            key=f"score_cond_value_{sidx}_{cidx}",
+                        )
+                with ccol3:
+                    if st.button("Remove", key=f"score_cond_remove_{sidx}_{cidx}"):
+                        conditions.pop(cidx)
+                        item["conditions"] = conditions
+                        tool["scoring_recommendations"] = scoring_recs
+                        st.session_state.editing_tool = tool
+                        st.rerun()
+
+                updated_conditions.append(
+                    {"input_id": cond_input_id, "op": "equals", "value": cond_value}
+                )
+
             updated_scoring_recs.append(
                 {
                     "min_score": int(min_score),
                     "level": level,
                     "message": message,
+                    "conditions": updated_conditions,
                 }
             )
 
@@ -1215,7 +1334,7 @@ def main():
         render_message(level, message)
 
         plus, minus, total = compute_scores(tool, preview_values)
-        score_reco = evaluate_score_recommendation(tool, total)
+        score_reco = evaluate_score_recommendation(tool, preview_values, total)
         if score_reco:
             render_message(score_reco.get("level", "info"), score_reco.get("message", ""))
             st.write(f"**Score:** {total}")
