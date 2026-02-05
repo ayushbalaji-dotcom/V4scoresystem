@@ -721,6 +721,7 @@ def render_message(level, message):
 def evaluate_rules(tool, values):
     best_match = None
     best_count = 0
+    best_ratio = 0.0
     for rule in tool.get("rules", []):
         conditions = rule.get("conditions", [])
         if not conditions:
@@ -732,8 +733,10 @@ def evaluate_rules(tool, values):
             actual = values.get(input_id)
             if actual == expected:
                 matched += 1
-        if matched > best_count:
+        ratio = matched / len(conditions) if conditions else 0.0
+        if matched > best_count or (matched == best_count and ratio > best_ratio):
             best_count = matched
+            best_ratio = ratio
             best_match = rule
 
     if best_match and best_count > 0:
@@ -765,7 +768,28 @@ def compute_scores(tool, values):
             plus += weight
         elif score == -1 and scoring_mode == "signed":
             minus += weight
-    return plus, minus
+    total = plus - minus if scoring_mode == "signed" else plus
+    return plus, minus, total
+
+
+def evaluate_score_recommendation(tool, total_score):
+    thresholds = tool.get("scoring_recommendations", [])
+    if not thresholds:
+        return None
+    best = None
+    for item in thresholds:
+        try:
+            min_score = int(item.get("min_score"))
+        except (TypeError, ValueError):
+            continue
+        if total_score >= min_score:
+            if best is None or min_score > best.get("min_score", -10**9):
+                best = {
+                    "min_score": min_score,
+                    "level": item.get("level", "info"),
+                    "message": item.get("message", ""),
+                }
+    return best
 
 
 def main():
@@ -1076,6 +1100,56 @@ def main():
         tool["fallback"] = {"level": fallback_level, "message": fallback_message}
 
         st.divider()
+        st.subheader("Score-Based Recommendation")
+        st.caption("Optional: show a recommendation based on total score thresholds.")
+        scoring_recs = tool.get("scoring_recommendations", [])
+        if st.button("Add Score Threshold"):
+            scoring_recs.append({"min_score": 0, "level": "info", "message": ""})
+            tool["scoring_recommendations"] = scoring_recs
+            st.session_state.editing_tool = tool
+            st.rerun()
+
+        updated_scoring_recs = []
+        for sidx, item in enumerate(scoring_recs):
+            cols = st.columns([2, 2, 6, 1])
+            with cols[0]:
+                min_score = st.number_input(
+                    "Min score",
+                    value=int(item.get("min_score", 0) or 0),
+                    step=1,
+                    key=f"score_min_{sidx}",
+                )
+            with cols[1]:
+                level = st.selectbox(
+                    "Level",
+                    options=LEVELS,
+                    index=LEVELS.index(item.get("level", "info")),
+                    key=f"score_level_{sidx}",
+                )
+            with cols[2]:
+                message = st.text_input(
+                    "Message",
+                    value=item.get("message", ""),
+                    key=f"score_msg_{sidx}",
+                )
+            with cols[3]:
+                if st.button("Remove", key=f"score_remove_{sidx}"):
+                    scoring_recs.pop(sidx)
+                    tool["scoring_recommendations"] = scoring_recs
+                    st.session_state.editing_tool = tool
+                    st.rerun()
+
+            updated_scoring_recs.append(
+                {
+                    "min_score": int(min_score),
+                    "level": level,
+                    "message": message,
+                }
+            )
+
+        tool["scoring_recommendations"] = updated_scoring_recs
+
+        st.divider()
         if st.button("Save Tool"):
             st.session_state.tools_data["tools"][st.session_state.selected_tool_id] = deepcopy(tool)
             save_tools(st.session_state.tools_data)
@@ -1140,9 +1214,17 @@ def main():
         level, message = evaluate_rules(tool, preview_values)
         render_message(level, message)
 
-        plus, minus = compute_scores(tool, preview_values)
-        st.write(f"✅ **Factors favoring intervention:** {plus}")
-        st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
+        plus, minus, total = compute_scores(tool, preview_values)
+        score_reco = evaluate_score_recommendation(tool, total)
+        if score_reco:
+            render_message(score_reco.get("level", "info"), score_reco.get("message", ""))
+            st.write(f"**Score:** {total}")
+        else:
+            if tool.get("scoring_mode", "signed") == "signed":
+                st.write(f"✅ **Factors favoring intervention:** {plus}")
+                st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
+            else:
+                st.write(f"**Score:** {total}")
 
 
 if __name__ == "__main__":
