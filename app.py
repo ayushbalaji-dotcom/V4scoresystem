@@ -23,29 +23,11 @@ GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_TOOL = {
     "name": "New Tool",
     "description": "",
-    "inputs": [
-        {"id": "example_yes_no", "label": "Example Yes/No?", "type": "select", "options": ["Yes", "No", "Unknown"]}
-    ],
-    "scoring_rules": [
-        {
-            "input_id": "example_yes_no",
-            "favor_values": ["Yes"],
-            "against_values": ["No"],
-            "invert_favor": False,
-            "weight": 1,
-        }
-    ],
-    "rules": [
-        {
-            "name": "Example Rule",
-            "level": "info",
-            "message": "Example: Rule matched",
-            "conditions": [
-                {"input_id": "example_yes_no", "op": "equals", "value": "Yes"}
-            ],
-        }
-    ],
-    "fallback": {"level": "warning", "message": "No rules matched."},
+    "inputs": [],
+    "scoring_rules": [],
+    "rules": [],
+    "scoring_recommendations": [],
+    "scoring_mode": "signed",
 }
 
 TRICUSPID_TOOL = {
@@ -1329,17 +1311,18 @@ def main():
         if level and message:
             render_message(level, message)
 
-        plus, minus, total = compute_scores(tool, preview_values)
-        score_reco = evaluate_score_recommendation(tool, preview_values, total)
-        if score_reco:
-            render_message(score_reco.get("level", "info"), score_reco.get("message", ""))
-            st.write(f"**Score:** {total}")
-        else:
-            if tool.get("scoring_mode", "signed") == "signed":
-                st.write(f"✅ **Factors favoring intervention:** {plus}")
-                st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
-            else:
+        if tool.get("scoring_rules"):
+            plus, minus, total = compute_scores(tool, preview_values)
+            score_reco = evaluate_score_recommendation(tool, preview_values, total)
+            if score_reco:
+                render_message(score_reco.get("level", "info"), score_reco.get("message", ""))
                 st.write(f"**Score:** {total}")
+            else:
+                if tool.get("scoring_mode", "signed") == "signed":
+                    st.write(f"✅ **Factors favoring intervention:** {plus}")
+                    st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
+                else:
+                    st.write(f"**Score:** {total}")
 
 
 if __name__ == "__main__":
