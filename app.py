@@ -266,8 +266,9 @@ def parse_free_text_rule(text: str) -> Dict:
     if client is None:
         raise RuntimeError("OpenAI client not configured. Add OPENAI_API_KEY to Streamlit secrets.")
 
-    schema = {
+    json_schema = {
         "name": "rule_parse",
+        "strict": True,
         "schema": {
             "type": "object",
             "properties": {
@@ -326,7 +327,12 @@ def parse_free_text_rule(text: str) -> Dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
-        response_format={"type": "json_schema", "json_schema": schema},
+        text={
+            "format": {
+                "type": "json_schema",
+                "schema": json_schema,
+            }
+        },
     )
 
     output_text = response.output_text
