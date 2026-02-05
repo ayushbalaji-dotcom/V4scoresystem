@@ -291,16 +291,31 @@ def parse_free_text_rule(text: str) -> Dict:
                 },
                 "required": ["name", "level", "message", "conditions"],
             },
+            "scoring_rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "favor_values": {"type": "array", "items": {"type": "string"}},
+                        "against_values": {"type": "array", "items": {"type": "string"}},
+                        "invert_favor": {"type": "boolean"},
+                        "weight": {"type": "integer"},
+                    },
+                    "required": ["label", "favor_values", "against_values", "invert_favor", "weight"],
+                },
+            },
         },
-        "required": ["inputs", "rule"],
+        "required": ["inputs", "rule", "scoring_rules"],
     }
 
     system_prompt = (
-        "You convert free-text clinical decision rules into structured inputs and a rule. "
+        "You convert free-text clinical decision rules into structured inputs, scoring rules, and a recommendation rule. "
         "Always return valid JSON matching the schema. "
         "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
-        "Keep labels short and human-readable."
+        "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
+        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list."
     )
 
     response = client.models.generate_content(
@@ -426,12 +441,46 @@ def get_input_options(inputs: List[Dict], input_id: str) -> List[str]:
     return []
 
 
+def questionize_label(label: str) -> str:
+    label = safe_str(label)
+    if not label:
+        return ""
+    if label.endswith("?"):
+        return label
+    starts = label.lower().strip()
+    question_starts = (
+        "what",
+        "which",
+        "when",
+        "how",
+        "is",
+        "are",
+        "does",
+        "do",
+        "did",
+        "has",
+        "have",
+        "was",
+        "were",
+        "can",
+        "should",
+        "could",
+        "would",
+        "will",
+    )
+    if starts.startswith(question_starts):
+        return f"{label}?"
+    return f"Does the patient have {label}?"
+
+
 def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
     inputs = tool.get("inputs", [])
-    existing_labels = {safe_str(item.get("label")) for item in inputs if safe_str(item.get("label"))}
+    existing_labels = {
+        safe_str(item.get("label")) for item in inputs if safe_str(item.get("label"))
+    }
 
     for item in parsed.get("inputs", []):
-        label = safe_str(item.get("label"))
+        label = questionize_label(item.get("label"))
         if not label or label in existing_labels:
             continue
         input_id = slugify(label)
@@ -451,7 +500,7 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
     rule = parsed.get("rule", {})
     conditions = []
     for cond in rule.get("conditions", []):
-        label = safe_str(cond.get("label"))
+        label = questionize_label(cond.get("label"))
         value = safe_str(cond.get("value"))
         input_id = label_to_id.get(label)
         if input_id and value:
@@ -466,6 +515,23 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
                 "conditions": conditions,
             }
         )
+
+    scoring_rules = tool.get("scoring_rules", [])
+    for srule in parsed.get("scoring_rules", []):
+        label = questionize_label(srule.get("label"))
+        input_id = label_to_id.get(label)
+        if not input_id:
+            continue
+        scoring_rules.append(
+            {
+                "input_id": input_id,
+                "favor_values": srule.get("favor_values", []),
+                "against_values": srule.get("against_values", []),
+                "invert_favor": bool(srule.get("invert_favor", False)),
+                "weight": int(srule.get("weight", 1) or 1),
+            }
+        )
+    tool["scoring_rules"] = scoring_rules
 
     return tool
 
