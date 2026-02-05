@@ -271,25 +271,28 @@ def parse_free_text_rule(text: str) -> Dict:
                     "required": ["label", "type", "options"],
                 },
             },
-            "rule": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                    "message": {"type": "string"},
-                    "conditions": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {"type": "string"},
-                                "value": {"type": "string"},
+            "rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
+                        "message": {"type": "string"},
+                        "conditions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["label", "value"],
                             },
-                            "required": ["label", "value"],
                         },
                     },
+                    "required": ["name", "level", "message", "conditions"],
                 },
-                "required": ["name", "level", "message", "conditions"],
             },
             "scoring_rules": {
                 "type": "array",
@@ -306,15 +309,16 @@ def parse_free_text_rule(text: str) -> Dict:
                 },
             },
         },
-        "required": ["inputs", "rule", "scoring_rules"],
+        "required": ["inputs", "rules", "scoring_rules"],
     }
 
     system_prompt = (
-        "You convert free-text clinical decision rules into structured inputs, scoring rules, and a recommendation rule. "
+        "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
         "Always return valid JSON matching the schema. "
         "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
+        "Return multiple recommendation rules when the text describes alternatives or exceptions. "
         "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list."
     )
 
@@ -497,24 +501,24 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
     tool["inputs"] = inputs
     id_to_label, label_to_id = build_label_maps(inputs)
 
-    rule = parsed.get("rule", {})
-    conditions = []
-    for cond in rule.get("conditions", []):
-        label = questionize_label(cond.get("label"))
-        value = safe_str(cond.get("value"))
-        input_id = label_to_id.get(label)
-        if input_id and value:
-            conditions.append({"input_id": input_id, "op": "equals", "value": value})
+    for rule in parsed.get("rules", []):
+        conditions = []
+        for cond in rule.get("conditions", []):
+            label = questionize_label(cond.get("label"))
+            value = safe_str(cond.get("value"))
+            input_id = label_to_id.get(label)
+            if input_id and value:
+                conditions.append({"input_id": input_id, "op": "equals", "value": value})
 
-    if conditions:
-        tool.setdefault("rules", []).append(
-            {
-                "name": safe_str(rule.get("name")) or "AI Rule",
-                "level": rule.get("level", "info"),
-                "message": safe_str(rule.get("message")),
-                "conditions": conditions,
-            }
-        )
+        if conditions:
+            tool.setdefault("rules", []).append(
+                {
+                    "name": safe_str(rule.get("name")) or "AI Rule",
+                    "level": rule.get("level", "info"),
+                    "message": safe_str(rule.get("message")),
+                    "conditions": conditions,
+                }
+            )
 
     scoring_rules = tool.get("scoring_rules", [])
     for srule in parsed.get("scoring_rules", []):
