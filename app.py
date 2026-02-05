@@ -381,6 +381,38 @@ def save_tool_to_github(tool: Dict) -> Tuple[bool, str]:
         return False, f"GitHub save failed: {exc}"
 
 
+def delete_tool_from_github(tool: Dict) -> Tuple[bool, str]:
+    token = get_github_token()
+    if not token:
+        return False, "Missing GitHub token. Add github_token to Streamlit secrets."
+
+    filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
+    path = f"{GITHUB_CALCULATORS_DIR}/{filename}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    try:
+        existing = github_request("GET", f"{url}?ref={GITHUB_BRANCH}", token)
+        existing_sha = existing.get("sha")
+        if not existing_sha:
+            return False, "File not found on GitHub."
+    except error.HTTPError as exc:
+        if exc.code == 404:
+            return False, "File not found on GitHub."
+        return False, f"GitHub lookup failed: {exc}"
+
+    payload = {
+        "message": f"Delete calculator {filename}",
+        "sha": existing_sha,
+        "branch": GITHUB_BRANCH,
+    }
+
+    try:
+        github_request("DELETE", url, token, payload)
+        return True, f"Deleted from GitHub: {path}"
+    except error.HTTPError as exc:
+        return False, f"GitHub delete failed: {exc}"
+
+
 def ensure_state():
     if "tools_data" not in st.session_state:
         st.session_state.tools_data = load_tools()
@@ -860,18 +892,20 @@ def main():
                     input_id = ""
             with cols[1]:
                 options = get_input_options(tool["inputs"], input_id)
+                default_favor = [v for v in rule.get("favor_values", []) if v in options]
                 favor_values = st.multiselect(
                     "Favor values",
                     options=options,
-                    default=rule.get("favor_values", []),
+                    default=default_favor,
                     key=f"score_favor_{idx}",
                 )
             with cols[2]:
                 options = get_input_options(tool["inputs"], input_id)
+                default_against = [v for v in rule.get("against_values", []) if v in options]
                 against_values = st.multiselect(
                     "Against values",
                     options=options,
-                    default=rule.get("against_values", []),
+                    default=default_against,
                     key=f"score_against_{idx}",
                 )
             with cols[3]:
@@ -1026,6 +1060,19 @@ def main():
                 st.success(message)
             else:
                 st.warning(message)
+
+        st.divider()
+        st.subheader("Delete Calculator")
+        confirm_delete = st.checkbox("I understand this will delete the calculator from GitHub")
+        if st.button("Delete from GitHub"):
+            if not confirm_delete:
+                st.warning("Please confirm deletion first.")
+            else:
+                ok, message = delete_tool_from_github(tool)
+                if ok:
+                    st.success(message)
+                else:
+                    st.warning(message)
         st.download_button(
             "Download Tool JSON",
             data=json.dumps(tool, indent=2),
@@ -1075,3 +1122,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
