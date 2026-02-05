@@ -8,9 +8,9 @@ from typing import Dict, List, Tuple
 from urllib import request, error
 
 try:
-    from openai import OpenAI
+    from google import genai
 except Exception:  # pragma: no cover
-    OpenAI = None
+    genai = None
 
 import streamlit as st
 
@@ -18,7 +18,7 @@ DATA_PATH = os.path.join("data", "tools.json")
 GITHUB_REPO = "ayushbalaji-dotcom/homepagev2"
 GITHUB_BRANCH = "main"
 GITHUB_CALCULATORS_DIR = "calculators"
-OPENAI_MODEL = "gpt-4o-mini"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 DEFAULT_TOOL = {
     "name": "New Tool",
@@ -248,69 +248,51 @@ def get_github_token():
     return st.secrets.get("github_token") or os.environ.get("GITHUB_TOKEN")
 
 
-def get_openai_key():
-    return st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-
-
-def get_openai_client():
-    if OpenAI is None:
-        return None
-    api_key = get_openai_key()
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
-
-
 def parse_free_text_rule(text: str) -> Dict:
-    client = get_openai_client()
-    if client is None:
-        raise RuntimeError("OpenAI client not configured. Add OPENAI_API_KEY to Streamlit secrets.")
+    if genai is None:
+        raise RuntimeError("Google GenAI client not available. Install google-genai.")
+    api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing Gemini API key. Add GEMINI_API_KEY to Streamlit secrets.")
+    client = genai.Client(api_key=api_key)
 
     json_schema = {
-        "name": "rule_parse",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "inputs": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "type": {"type": "string", "enum": ["select", "number", "text"]},
-                            "options": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["label", "type", "options"],
-                        "additionalProperties": False,
-                    },
-                },
-                "rule": {
+        "type": "object",
+        "properties": {
+            "inputs": {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                        "message": {"type": "string"},
-                        "conditions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "value": {"type": "string"},
-                                },
-                                "required": ["label", "value"],
-                                "additionalProperties": False,
-                            },
-                        },
+                        "label": {"type": "string"},
+                        "type": {"type": "string", "enum": ["select", "number", "text"]},
+                        "options": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["name", "level", "message", "conditions"],
-                    "additionalProperties": False,
+                    "required": ["label", "type", "options"],
                 },
             },
-            "required": ["inputs", "rule"],
-            "additionalProperties": False,
+            "rule": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
+                    "message": {"type": "string"},
+                    "conditions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "value": {"type": "string"},
+                            },
+                            "required": ["label", "value"],
+                        },
+                    },
+                },
+                "required": ["name", "level", "message", "conditions"],
+            },
         },
+        "required": ["inputs", "rule"],
     }
 
     system_prompt = (
@@ -321,24 +303,16 @@ def parse_free_text_rule(text: str) -> Dict:
         "Keep labels short and human-readable."
     )
 
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "rule_parse",
-                "schema": json_schema["schema"],
-                "strict": True,
-            }
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[system_prompt, text],
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": json_schema,
         },
     )
 
-    output_text = response.output_text
-    return json.loads(output_text)
+    return json.loads(response.text)
 
 
 def github_request(method: str, url: str, token: str, payload: Dict | None = None):
