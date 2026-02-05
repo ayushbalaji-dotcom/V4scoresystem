@@ -330,7 +330,9 @@ def parse_free_text_rule(text: str) -> Dict:
         text={
             "format": {
                 "type": "json_schema",
-                "schema": json_schema,
+                "name": "rule_parse",
+                "schema": json_schema["schema"],
+                "strict": True,
             }
         },
     )
