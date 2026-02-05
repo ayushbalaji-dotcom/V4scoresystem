@@ -45,8 +45,7 @@ DEFAULT_TOOL = {
             ],
         }
     ],
-    "fallback": {"level": "warning", "message": "No rules matched."},
-}
+
 
 TRICUSPID_TOOL = {
     "name": "Concomitant Tricuspid Repair Evaluator",
