@@ -45,7 +45,8 @@ DEFAULT_TOOL = {
             ],
         }
     ],
-
+    "fallback": {"level": "warning", "message": "No rules matched."},
+}
 
 TRICUSPID_TOOL = {
     "name": "Concomitant Tricuspid Repair Evaluator",
@@ -789,8 +790,7 @@ def evaluate_rules(tool, values):
     if best_match and best_count > 0:
         return best_match.get("level", "info"), best_match.get("message", "")
 
-    fallback = tool.get("fallback", {"level": "warning", "message": "No rules matched."})
-    return fallback.get("level", "warning"), fallback.get("message", "No rules matched.")
+    return None, None
 
 
 def compute_scores(tool, values):
@@ -1160,11 +1160,6 @@ def main():
 
         tool["rules"] = updated_rules
 
-        st.subheader("Fallback Message")
-        fallback_level = st.selectbox("Fallback level", LEVELS, index=LEVELS.index(tool.get("fallback", {}).get("level", "warning")))
-        fallback_message = st.text_input("Fallback message", value=tool.get("fallback", {}).get("message", "No rules matched."))
-        tool["fallback"] = {"level": fallback_level, "message": fallback_message}
-
         st.divider()
         st.subheader("Score-Based Recommendation")
         st.caption("Optional: show a recommendation based on total score thresholds.")
@@ -1330,7 +1325,8 @@ def main():
         st.divider()
         st.subheader("Results")
         level, message = evaluate_rules(tool, preview_values)
-        render_message(level, message)
+        if level and message:
+            render_message(level, message)
 
         plus, minus, total = compute_scores(tool, preview_values)
         score_reco = evaluate_score_recommendation(tool, preview_values, total)
