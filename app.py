@@ -769,6 +769,7 @@ def evaluate_rules(tool, values):
     best_match = None
     best_count = 0
     best_ratio = 0.0
+    best_total_conditions = 0
     for rule in tool.get("rules", []):
         conditions = rule.get("conditions", [])
         if not conditions:
@@ -781,9 +782,17 @@ def evaluate_rules(tool, values):
             if actual == expected:
                 matched += 1
         ratio = matched / len(conditions) if conditions else 0.0
+        if ratio == 1.0 and best_ratio == 1.0:
+            if len(conditions) > best_total_conditions:
+                best_count = matched
+                best_ratio = ratio
+                best_total_conditions = len(conditions)
+                best_match = rule
+                continue
         if matched > best_count or (matched == best_count and ratio > best_ratio):
             best_count = matched
             best_ratio = ratio
+            best_total_conditions = len(conditions)
             best_match = rule
 
     if best_match and best_count > 0:
