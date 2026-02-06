@@ -18,6 +18,12 @@ DATA_PATH = os.path.join("data", "tools.json")
 GITHUB_REPO = "ayushbalaji-dotcom/homepagev2"
 GITHUB_BRANCH = "main"
 GITHUB_CALCULATORS_DIR = "calculators"
+
+CATEGORIES = {
+    "Cardiac": ["Coronary", "Aortic", "Tricuspid", "Mitral", "Pulmonary", "Arrhythmia", "Miscellaneous"],
+    "Thoracic": ["Malignant", "Benign"],
+    "Transplant": [],
+}
 GEMINI_MODEL = "gemini-2.5-flash"
 
 DEFAULT_TOOL = {
@@ -367,7 +373,12 @@ def save_tool_to_github(tool: Dict) -> Tuple[bool, str]:
         return False, "Missing GitHub token. Add github_token to Streamlit secrets."
 
     filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
-    path = f"{GITHUB_CALCULATORS_DIR}/{filename}"
+    category = safe_str(tool.get("category")) or "Uncategorized"
+    subcategory = safe_str(tool.get("subcategory"))
+    if subcategory:
+        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
+    else:
+        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
     existing_sha = None
@@ -400,7 +411,12 @@ def delete_tool_from_github(tool: Dict) -> Tuple[bool, str]:
         return False, "Missing GitHub token. Add github_token to Streamlit secrets."
 
     filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
-    path = f"{GITHUB_CALCULATORS_DIR}/{filename}"
+    category = safe_str(tool.get("category")) or "Uncategorized"
+    subcategory = safe_str(tool.get("subcategory"))
+    if subcategory:
+        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
+    else:
+        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
     try:
@@ -904,6 +920,30 @@ def main():
         st.subheader("Tool Details")
         tool["name"] = st.text_input("Tool name", value=tool.get("name", ""))
         tool["description"] = st.text_area("Description", value=tool.get("description", ""))
+        col_a, col_b = st.columns(2)
+        with col_a:
+            category = st.selectbox(
+                "Section",
+                options=list(CATEGORIES.keys()),
+                index=list(CATEGORIES.keys()).index(tool.get("category", "Cardiac"))
+                if tool.get("category", "Cardiac") in CATEGORIES
+                else 0,
+            )
+        with col_b:
+            subcats = CATEGORIES.get(category, [])
+            if subcats:
+                subcategory = st.selectbox(
+                    "Subsection",
+                    options=subcats,
+                    index=subcats.index(tool.get("subcategory", subcats[0]))
+                    if tool.get("subcategory") in subcats
+                    else 0,
+                )
+            else:
+                subcategory = ""
+                st.text_input("Subsection", value="(none)", disabled=True)
+        tool["category"] = category
+        tool["subcategory"] = subcategory
         scoring_mode = st.selectbox(
             "Scoring mode",
             ["signed", "positive-only"],
