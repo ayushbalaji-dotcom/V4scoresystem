@@ -267,6 +267,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                         "name": {"type": "string"},
                         "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
                         "message": {"type": "string"},
+                        "condition_operator": {"type": "string", "enum": ["AND", "OR"]},
                         "conditions": {
                             "type": "array",
                             "items": {
@@ -279,7 +280,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                             },
                         },
                     },
-                    "required": ["name", "level", "message", "conditions"],
+                    "required": ["name", "level", "message", "condition_operator", "conditions"],
                 },
             },
             "scoring_rules": {
@@ -334,6 +335,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
         "Return multiple recommendation rules when the text describes alternatives or exceptions. "
+        "Set condition_operator to 'OR' when the recommendation is triggered by any one condition; otherwise use 'AND'. "
         "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
         "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
         "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
@@ -367,18 +369,94 @@ def github_request(method: str, url: str, token: str, payload: Dict | None = Non
         return json.loads(resp.read().decode("utf-8"))
 
 
-def save_tool_to_github(tool: Dict) -> Tuple[bool, str]:
+def tool_id_from_github_path(path: str) -> str:
+    return "gh_" + re.sub(r"[^a-zA-Z0-9_]+", "_", path).strip("_").lower()
+
+
+def list_github_calculator_paths(token: str) -> List[str]:
+    def walk(dir_path: str) -> List[str]:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{dir_path}?ref={GITHUB_BRANCH}"
+        entries = github_request("GET", url, token)
+        paths: List[str] = []
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries:
+            if entry.get("type") == "dir":
+                paths.extend(walk(entry.get("path", "")))
+            elif entry.get("type") == "file" and safe_str(entry.get("name")).endswith(".json"):
+                paths.append(entry.get("path"))
+        return paths
+
+    return walk(GITHUB_CALCULATORS_DIR)
+
+
+def parse_category_from_github_path(path: str) -> Tuple[str, str]:
+    parts = path.split("/")
+    # calculators/<category>/<subcategory>/<file>.json
+    category = parts[1] if len(parts) >= 3 else "Cardiac"
+    subcategory = parts[2] if len(parts) >= 4 else ""
+    return category, subcategory
+
+
+def sync_tools_from_github(data: Dict) -> Tuple[Dict, int, str]:
     token = get_github_token()
     if not token:
-        return False, "Missing GitHub token. Add github_token to Streamlit secrets."
+        return data, 0, "Skipping GitHub sync (missing token)."
+
+    try:
+        paths = list_github_calculator_paths(token)
+    except Exception as exc:
+        return data, 0, f"GitHub sync failed: {exc}"
+
+    tools = data.setdefault("tools", {})
+    by_path = {
+        safe_str(t.get("github_path")): tool_id
+        for tool_id, t in tools.items()
+        if safe_str(t.get("github_path"))
+    }
+    synced = 0
+
+    for path in paths:
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}"
+            content_obj = github_request("GET", url, token)
+            encoded = safe_str(content_obj.get("content")).replace("\n", "")
+            parsed = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        except Exception:
+            continue
+
+        category, subcategory = parse_category_from_github_path(path)
+        parsed["category"] = category
+        parsed["subcategory"] = subcategory
+        parsed["github_path"] = path
+
+        tool_id = by_path.get(path) or tool_id_from_github_path(path)
+        tools[tool_id] = parsed
+        synced += 1
+
+    return data, synced, f"Synced {synced} calculators from GitHub."
+
+
+def save_tool_to_github(tool: Dict) -> Tuple[bool, str, str]:
+    token = get_github_token()
+    if not token:
+        return False, "Missing GitHub token. Add github_token to Streamlit secrets.", ""
 
     filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
     category = safe_str(tool.get("category")) or "Uncategorized"
     subcategory = safe_str(tool.get("subcategory"))
-    if subcategory:
-        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
+    target_path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}" if subcategory else f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
+
+    previous_path = safe_str(tool.get("github_path"))
+    path = previous_path or target_path
+    if previous_path and previous_path != target_path:
+        # Treat category/name change as a move: write new path, then delete old.
+        path = target_path
+
+    if subcategory and not previous_path:
+        path = target_path
     else:
-        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
+        path = target_path
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
     existing_sha = None
@@ -387,7 +465,7 @@ def save_tool_to_github(tool: Dict) -> Tuple[bool, str]:
         existing_sha = existing.get("sha")
     except error.HTTPError as exc:
         if exc.code != 404:
-            return False, f"GitHub lookup failed: {exc}"
+            return False, f"GitHub lookup failed: {exc}", ""
 
     content = json.dumps(tool, indent=2).encode("utf-8")
     payload = {
@@ -400,9 +478,23 @@ def save_tool_to_github(tool: Dict) -> Tuple[bool, str]:
 
     try:
         github_request("PUT", url, token, payload)
-        return True, f"Saved to GitHub: {path}"
+        if previous_path and previous_path != target_path:
+            old_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{previous_path}"
+            try:
+                old = github_request("GET", f"{old_url}?ref={GITHUB_BRANCH}", token)
+                old_sha = old.get("sha")
+                if old_sha:
+                    github_request(
+                        "DELETE",
+                        old_url,
+                        token,
+                        {"message": f"Move calculator to {target_path}", "sha": old_sha, "branch": GITHUB_BRANCH},
+                    )
+            except Exception:
+                pass
+        return True, f"Saved to GitHub: {path}", path
     except error.HTTPError as exc:
-        return False, f"GitHub save failed: {exc}"
+        return False, f"GitHub save failed: {exc}", ""
 
 
 def delete_tool_from_github(tool: Dict) -> Tuple[bool, str]:
@@ -413,10 +505,12 @@ def delete_tool_from_github(tool: Dict) -> Tuple[bool, str]:
     filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
     category = safe_str(tool.get("category")) or "Uncategorized"
     subcategory = safe_str(tool.get("subcategory"))
-    if subcategory:
-        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
-    else:
-        path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
+    path = safe_str(tool.get("github_path"))
+    if not path:
+        if subcategory:
+            path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
+        else:
+            path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
 
     try:
@@ -449,6 +543,10 @@ def ensure_state():
         if "tricuspid_repair" not in tools:
             tools["tricuspid_repair"] = deepcopy(TRICUSPID_TOOL)
             save_tools(st.session_state.tools_data)
+        st.session_state.tools_data, synced_count, sync_message = sync_tools_from_github(st.session_state.tools_data)
+        st.session_state.github_sync_message = sync_message
+        st.session_state.github_synced_count = synced_count
+        save_tools(st.session_state.tools_data)
     if "selected_tool_id" not in st.session_state:
         tool_ids = list(st.session_state.tools_data.get("tools", {}).keys())
         st.session_state.selected_tool_id = tool_ids[0] if tool_ids else None
@@ -458,6 +556,10 @@ def ensure_state():
         st.session_state.editing_tool_id = None
     if "preview_values" not in st.session_state:
         st.session_state.preview_values = {}
+    if "github_sync_message" not in st.session_state:
+        st.session_state.github_sync_message = ""
+    if "github_synced_count" not in st.session_state:
+        st.session_state.github_synced_count = 0
 
 
 def normalize_options(options_csv):
@@ -577,6 +679,7 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
                     "name": safe_str(rule.get("name")) or "AI Rule",
                     "level": rule.get("level", "info"),
                     "message": safe_str(rule.get("message")),
+                    "condition_operator": safe_str(rule.get("condition_operator", "AND")).upper() or "AND",
                     "conditions": conditions,
                 }
             )
@@ -766,33 +869,64 @@ def render_message(level, message):
 
 
 def evaluate_rules(tool, values):
+    def condition_match(cond: Dict) -> bool:
+        input_id = cond.get("input_id")
+        expected = cond.get("value")
+        return values.get(input_id) == expected
+
+    def evaluate_condition_expression(rule: Dict) -> Tuple[bool, int, float, int]:
+        conditions = rule.get("conditions", [])
+        if not conditions:
+            return False, 0, 0.0, 0
+
+        default_join = safe_str(rule.get("condition_operator", "AND")).upper()
+        if default_join not in {"AND", "OR"}:
+            default_join = "AND"
+
+        matched_count = 0
+        first_match = condition_match(conditions[0])
+        if first_match:
+            matched_count += 1
+        current_group = first_match
+        group_results: List[bool] = []
+
+        for cond in conditions[1:]:
+            cond_is_match = condition_match(cond)
+            if cond_is_match:
+                matched_count += 1
+            join = safe_str(cond.get("join_with_previous", default_join)).upper()
+            if join not in {"AND", "OR"}:
+                join = default_join
+            if join == "AND":
+                current_group = current_group and cond_is_match
+            else:
+                group_results.append(current_group)
+                current_group = cond_is_match
+
+        group_results.append(current_group)
+        is_match = any(group_results)
+        ratio = matched_count / len(conditions)
+        return is_match, matched_count, ratio, len(conditions)
+
     best_match = None
     best_count = 0
     best_ratio = 0.0
     best_total_conditions = 0
     for rule in tool.get("rules", []):
-        conditions = rule.get("conditions", [])
-        if not conditions:
+        is_match, matched, ratio, condition_count = evaluate_condition_expression(rule)
+        if not is_match:
             continue
-        matched = 0
-        for cond in conditions:
-            input_id = cond.get("input_id")
-            expected = cond.get("value")
-            actual = values.get(input_id)
-            if actual == expected:
-                matched += 1
-        ratio = matched / len(conditions) if conditions else 0.0
         if ratio == 1.0 and best_ratio == 1.0:
-            if len(conditions) > best_total_conditions:
+            if condition_count > best_total_conditions:
                 best_count = matched
                 best_ratio = ratio
-                best_total_conditions = len(conditions)
+                best_total_conditions = condition_count
                 best_match = rule
                 continue
         if matched > best_count or (matched == best_count and ratio > best_ratio):
             best_count = matched
             best_ratio = ratio
-            best_total_conditions = len(conditions)
+            best_total_conditions = condition_count
             best_match = rule
 
     if best_match and best_count > 0:
@@ -866,6 +1000,41 @@ def evaluate_score_recommendation(tool, values, total_score):
     return best
 
 
+def build_decision_tree_graph(tool: Dict, id_to_label: Dict[str, str]) -> str:
+    lines = ["digraph DecisionTree {", 'rankdir=LR;', 'node [shape=box, style="rounded"];']
+    lines.append('start [label="Start"];')
+    for ridx, rule in enumerate(tool.get("rules", [])):
+        rule_node = f"rule_{ridx}"
+        rule_label = safe_str(rule.get("name")) or f"Rule {ridx + 1}"
+        lines.append(f'{rule_node} [label="{rule_label}"];')
+        lines.append(f"start -> {rule_node};")
+
+        prev_node = rule_node
+        for cidx, cond in enumerate(rule.get("conditions", [])):
+            cond_node = f"rule_{ridx}_cond_{cidx}"
+            input_label = id_to_label.get(cond.get("input_id", ""), cond.get("input_id", ""))
+            value = safe_str(cond.get("value"))
+            cond_label = f"{input_label} = {value}".replace('"', "'")
+            lines.append(f'{cond_node} [label="{cond_label}"];')
+            edge_label = ""
+            if cidx > 0:
+                edge_label = safe_str(cond.get("join_with_previous", "AND")).upper()
+            if edge_label:
+                lines.append(f'{prev_node} -> {cond_node} [label="{edge_label}"];')
+            else:
+                lines.append(f"{prev_node} -> {cond_node};")
+            prev_node = cond_node
+
+        out_node = f"rule_{ridx}_out"
+        msg = safe_str(rule.get("message")) or "Recommendation"
+        msg = msg.replace('"', "'")
+        lines.append(f'{out_node} [shape=note, label="{msg}"];')
+        lines.append(f"{prev_node} -> {out_node};")
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def main():
     st.set_page_config(page_title="Tool Builder", layout="wide")
     st.title("Tool Builder")
@@ -908,6 +1077,16 @@ def main():
             save_tools(st.session_state.tools_data)
             st.session_state.selected_tool_id = "tricuspid_repair"
             st.rerun()
+
+        if st.button("Sync from GitHub"):
+            st.session_state.tools_data, synced_count, sync_message = sync_tools_from_github(st.session_state.tools_data)
+            st.session_state.github_synced_count = synced_count
+            st.session_state.github_sync_message = sync_message
+            save_tools(st.session_state.tools_data)
+            st.rerun()
+
+        if st.session_state.github_sync_message:
+            st.caption(st.session_state.github_sync_message)
 
         if tool_ids:
             if st.button("Delete Tool"):
@@ -1097,6 +1276,7 @@ def main():
                     "name": "",
                     "level": "info",
                     "message": "",
+                    "condition_operator": "AND",
                     "conditions": [],
                 }
             )
@@ -1117,6 +1297,14 @@ def main():
                     index=LEVELS.index(rule.get("level", "info")),
                     key=f"rule_level_{ridx}",
                 )
+            condition_operator = st.selectbox(
+                "Condition logic",
+                options=["AND", "OR"],
+                index=["AND", "OR"].index(safe_str(rule.get("condition_operator", "AND")).upper())
+                if safe_str(rule.get("condition_operator", "AND")).upper() in ["AND", "OR"]
+                else 0,
+                key=f"rule_op_{ridx}",
+            )
             message = st.text_area(
                 "Message",
                 value=rule.get("message", ""),
@@ -1134,7 +1322,23 @@ def main():
 
             updated_conditions = []
             for cidx, cond in enumerate(conditions):
-                ccol1, ccol2, ccol3 = st.columns([3, 3, 1])
+                ccol0, ccol1, ccol2, ccol3 = st.columns([2, 3, 3, 1])
+                with ccol0:
+                    if cidx == 0:
+                        join_with_previous = "AND"
+                        st.text_input("Join", value="START", disabled=True, key=f"cond_join_{ridx}_{cidx}_label")
+                    else:
+                        join_with_previous = st.selectbox(
+                            "Join",
+                            options=["AND", "OR"],
+                            index=["AND", "OR"].index(
+                                safe_str(cond.get("join_with_previous", "AND")).upper()
+                            )
+                            if safe_str(cond.get("join_with_previous", "AND")).upper() in ["AND", "OR"]
+                            else 0,
+                            key=f"cond_join_{ridx}_{cidx}",
+                        )
+
                 with ccol1:
                     if label_options:
                         cond_label = id_to_label.get(cond.get("input_id", ""), "")
@@ -1148,6 +1352,7 @@ def main():
                     else:
                         st.warning("Add inputs first.")
                         cond_input_id = ""
+
                 with ccol2:
                     options = get_input_options(tool["inputs"], cond_input_id)
                     if options:
@@ -1163,6 +1368,7 @@ def main():
                             value=safe_str(cond.get("value")),
                             key=f"cond_value_{ridx}_{cidx}",
                         )
+
                 with ccol3:
                     if st.button("Remove", key=f"remove_condition_{ridx}_{cidx}"):
                         conditions.pop(cidx)
@@ -1172,7 +1378,12 @@ def main():
                         st.rerun()
 
                 updated_conditions.append(
-                    {"input_id": cond_input_id, "op": "equals", "value": cond_value}
+                    {
+                        "input_id": cond_input_id,
+                        "op": "equals",
+                        "value": cond_value,
+                        "join_with_previous": join_with_previous if cidx > 0 else "AND",
+                    }
                 )
 
             if st.button("Delete Recommendation Rule", key=f"delete_rule_{ridx}"):
@@ -1186,6 +1397,7 @@ def main():
                     "name": name,
                     "level": level,
                     "message": message,
+                    "condition_operator": condition_operator,
                     "conditions": updated_conditions,
                 }
             )
@@ -1296,10 +1508,12 @@ def main():
 
         st.divider()
         if st.button("Save Tool"):
+            ok, message, github_path = save_tool_to_github(tool)
+            if github_path:
+                tool["github_path"] = github_path
             st.session_state.tools_data["tools"][st.session_state.selected_tool_id] = deepcopy(tool)
             save_tools(st.session_state.tools_data)
             st.success("Tool saved.")
-            ok, message = save_tool_to_github(tool)
             if ok:
                 st.success(message)
             else:
@@ -1315,6 +1529,15 @@ def main():
                 ok, message = delete_tool_from_github(tool)
                 if ok:
                     st.success(message)
+                    current_id = st.session_state.selected_tool_id
+                    if current_id in st.session_state.tools_data.get("tools", {}):
+                        del st.session_state.tools_data["tools"][current_id]
+                        save_tools(st.session_state.tools_data)
+                        remaining_ids = list(st.session_state.tools_data.get("tools", {}).keys())
+                        st.session_state.selected_tool_id = remaining_ids[0] if remaining_ids else None
+                        st.session_state.editing_tool = None
+                        st.session_state.editing_tool_id = None
+                        st.rerun()
                 else:
                     st.warning(message)
         st.download_button(
@@ -1372,6 +1595,10 @@ def main():
                     st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
                 else:
                     st.write(f"**Score:** {total}")
+
+        if st.checkbox("Show decision tree", key="show_decision_tree"):
+            id_to_label, _ = build_label_maps(tool.get("inputs", []))
+            st.graphviz_chart(build_decision_tree_graph(tool, id_to_label))
 
 
 if __name__ == "__main__":
