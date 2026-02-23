@@ -244,26 +244,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         raise RuntimeError("Missing Gemini API key. Add GEMINI_API_KEY to Streamlit secrets.")
     client = genai.Client(api_key=api_key)
 
-    scoring_line = (
-        "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
-        "If scoring_mode is 'signed', you may use both favor_values and against_values."
-    )
-    base_prompt = (
-        "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
-        "Always return valid JSON in the requested shape. "
-        "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
-        "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
-        "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
-        "Return multiple recommendation rules when the text describes alternatives or exceptions. "
-        "Set condition_operator to 'OR' when the recommendation is triggered by any one condition; otherwise use 'AND'. "
-        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
-        "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
-        "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
-        "If the text includes a class label (e.g., Class I, Class IIa, Class 1B), include that phrase in the rule message (and optionally the rule name). "
-        + scoring_line
-    )
-
-    schema_inputs_rules = {
+    json_schema = {
         "type": "object",
         "properties": {
             "inputs": {
@@ -293,7 +274,6 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                                 "type": "object",
                                 "properties": {
                                     "label": {"type": "string"},
-                                    "op": {"type": "string", "enum": ["equals", "not_equals"]},
                                     "value": {"type": "string"},
                                 },
                                 "required": ["label", "value"],
@@ -303,13 +283,6 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                     "required": ["name", "level", "message", "condition_operator", "conditions"],
                 },
             },
-        },
-        "required": ["inputs", "rules"],
-    }
-
-    schema_scoring = {
-        "type": "object",
-        "properties": {
             "scoring_rules": {
                 "type": "array",
                 "items": {
@@ -348,34 +321,38 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                 },
             },
         },
-        "required": ["scoring_rules", "scoring_recommendations"],
+        "required": ["inputs", "rules", "scoring_rules", "scoring_recommendations"],
     }
 
-    response_inputs = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f"{base_prompt}\nscoring_mode={scoring_mode}\nReturn only inputs and rules.", text],
-        config={"response_mime_type": "application/json", "response_json_schema": schema_inputs_rules},
+    scoring_line = (
+        "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
+        "If scoring_mode is 'signed', you may use both favor_values and against_values."
     )
-    response_scoring = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f"{base_prompt}\nscoring_mode={scoring_mode}\nReturn only scoring_rules and scoring_recommendations.", text],
-        config={"response_mime_type": "application/json", "response_json_schema": schema_scoring},
+    system_prompt = (
+        "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
+        "Always return valid JSON matching the schema. "
+        "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
+        "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
+        "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
+        "Return multiple recommendation rules when the text describes alternatives or exceptions. "
+        "Set condition_operator to 'OR' when the recommendation is triggered by any one condition; otherwise use 'AND'. "
+        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
+        "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
+        "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
+        "If the text includes a class label (e.g., Class I, Class IIa, Class 1B), include that phrase in the rule message (and optionally the rule name). "
+        + scoring_line
     )
 
-    parsed_inputs = json.loads(response_inputs.text)
-    parsed_scoring = json.loads(response_scoring.text)
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[f"{system_prompt}\nscoring_mode={scoring_mode}", text],
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": json_schema,
+        },
+    )
 
-    if not isinstance(parsed_inputs, dict):
-        parsed_inputs = {}
-    if not isinstance(parsed_scoring, dict):
-        parsed_scoring = {}
-
-    return {
-        "inputs": parsed_inputs.get("inputs", []) if isinstance(parsed_inputs.get("inputs", []), list) else [],
-        "rules": parsed_inputs.get("rules", []) if isinstance(parsed_inputs.get("rules", []), list) else [],
-        "scoring_rules": parsed_scoring.get("scoring_rules", []) if isinstance(parsed_scoring.get("scoring_rules", []), list) else [],
-        "scoring_recommendations": parsed_scoring.get("scoring_recommendations", []) if isinstance(parsed_scoring.get("scoring_recommendations", []), list) else [],
-    }
+    return json.loads(response.text)
 
 
 def github_request(method: str, url: str, token: str, payload: Dict | None = None):
@@ -692,10 +669,9 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
         for cond in rule.get("conditions", []):
             label = questionize_label(cond.get("label"))
             value = safe_str(cond.get("value"))
-            op = safe_str(cond.get("op", "equals")) or "equals"
             input_id = label_to_id.get(label)
             if input_id and value:
-                conditions.append({"input_id": input_id, "op": op, "value": value})
+                conditions.append({"input_id": input_id, "op": "equals", "value": value})
 
         if conditions:
             tool.setdefault("rules", []).append(
@@ -731,10 +707,9 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
         for cond in item.get("conditions", []):
             label = questionize_label(cond.get("label"))
             value = safe_str(cond.get("value"))
-            op = safe_str(cond.get("op", "equals")) or "equals"
             input_id = label_to_id.get(label)
             if input_id and value:
-                conditions.append({"input_id": input_id, "op": op, "value": value})
+                conditions.append({"input_id": input_id, "op": "equals", "value": value})
         try:
             min_score = int(item.get("min_score"))
         except (TypeError, ValueError):
@@ -897,11 +872,7 @@ def evaluate_rules(tool, values):
     def condition_match(cond: Dict) -> bool:
         input_id = cond.get("input_id")
         expected = cond.get("value")
-        op = safe_str(cond.get("op", "equals")) or "equals"
-        actual = values.get(input_id)
-        if op == "not_equals":
-            return actual != expected
-        return actual == expected
+        return values.get(input_id) == expected
 
     def evaluate_condition_expression(rule: Dict) -> Tuple[bool, int, float, int]:
         conditions = rule.get("conditions", [])
@@ -1351,7 +1322,7 @@ def main():
 
             updated_conditions = []
             for cidx, cond in enumerate(conditions):
-                ccol0, ccol1, ccol2, ccol3, ccol4 = st.columns([2, 3, 3, 3, 1])
+                ccol0, ccol1, ccol2, ccol3 = st.columns([2, 3, 3, 1])
                 with ccol0:
                     if cidx == 0:
                         join_with_previous = "AND"
@@ -1383,17 +1354,6 @@ def main():
                         cond_input_id = ""
 
                 with ccol2:
-                    cond_op = st.selectbox(
-                        "Operator",
-                        options=["equals", "not_equals"],
-                        index=["equals", "not_equals"].index(
-                            safe_str(cond.get("op", "equals"))
-                        )
-                        if safe_str(cond.get("op", "equals")) in ["equals", "not_equals"]
-                        else 0,
-                        key=f"cond_op_{ridx}_{cidx}",
-                    )
-                with ccol3:
                     options = get_input_options(tool["inputs"], cond_input_id)
                     if options:
                         cond_value = st.selectbox(
@@ -1409,7 +1369,7 @@ def main():
                             key=f"cond_value_{ridx}_{cidx}",
                         )
 
-                with ccol4:
+                with ccol3:
                     if st.button("Remove", key=f"remove_condition_{ridx}_{cidx}"):
                         conditions.pop(cidx)
                         rules[ridx]["conditions"] = conditions
@@ -1420,7 +1380,7 @@ def main():
                 updated_conditions.append(
                     {
                         "input_id": cond_input_id,
-                        "op": cond_op,
+                        "op": "equals",
                         "value": cond_value,
                         "join_with_previous": join_with_previous if cidx > 0 else "AND",
                     }
