@@ -274,6 +274,7 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
                                 "type": "object",
                                 "properties": {
                                     "label": {"type": "string"},
+                                    "op": {"type": "string", "enum": ["equals", "not_equals"]},
                                     "value": {"type": "string"},
                                 },
                                 "required": ["label", "value"],
@@ -669,9 +670,10 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
         for cond in rule.get("conditions", []):
             label = questionize_label(cond.get("label"))
             value = safe_str(cond.get("value"))
+            op = safe_str(cond.get("op", "equals")) or "equals"
             input_id = label_to_id.get(label)
             if input_id and value:
-                conditions.append({"input_id": input_id, "op": "equals", "value": value})
+                conditions.append({"input_id": input_id, "op": op, "value": value})
 
         if conditions:
             tool.setdefault("rules", []).append(
@@ -707,9 +709,10 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
         for cond in item.get("conditions", []):
             label = questionize_label(cond.get("label"))
             value = safe_str(cond.get("value"))
+            op = safe_str(cond.get("op", "equals")) or "equals"
             input_id = label_to_id.get(label)
             if input_id and value:
-                conditions.append({"input_id": input_id, "op": "equals", "value": value})
+                conditions.append({"input_id": input_id, "op": op, "value": value})
         try:
             min_score = int(item.get("min_score"))
         except (TypeError, ValueError):
@@ -872,7 +875,11 @@ def evaluate_rules(tool, values):
     def condition_match(cond: Dict) -> bool:
         input_id = cond.get("input_id")
         expected = cond.get("value")
-        return values.get(input_id) == expected
+        op = safe_str(cond.get("op", "equals")) or "equals"
+        actual = values.get(input_id)
+        if op == "not_equals":
+            return actual != expected
+        return actual == expected
 
     def evaluate_condition_expression(rule: Dict) -> Tuple[bool, int, float, int]:
         conditions = rule.get("conditions", [])
@@ -908,31 +915,34 @@ def evaluate_rules(tool, values):
         ratio = matched_count / len(conditions)
         return is_match, matched_count, ratio, len(conditions)
 
-    best_match = None
-    best_count = 0
-    best_ratio = 0.0
-    best_total_conditions = 0
+    matches = []
     for rule in tool.get("rules", []):
         is_match, matched, ratio, condition_count = evaluate_condition_expression(rule)
         if not is_match:
             continue
-        if ratio == 1.0 and best_ratio == 1.0:
-            if condition_count > best_total_conditions:
-                best_count = matched
-                best_ratio = ratio
-                best_total_conditions = condition_count
-                best_match = rule
-                continue
-        if matched > best_count or (matched == best_count and ratio > best_ratio):
-            best_count = matched
-            best_ratio = ratio
-            best_total_conditions = condition_count
-            best_match = rule
+        matches.append(
+            {
+                "rule": rule,
+                "matched": matched,
+                "ratio": ratio,
+                "condition_count": condition_count,
+            }
+        )
 
-    if best_match and best_count > 0:
-        return best_match.get("level", "info"), best_match.get("message", "")
+    if not matches:
+        return []
 
-    return None, None
+    # Sort by full match first, then matched count, then ratio, then specificity.
+    matches.sort(
+        key=lambda m: (
+            1 if m["ratio"] == 1.0 else 0,
+            m["matched"],
+            m["ratio"],
+            m["condition_count"],
+        ),
+        reverse=True,
+    )
+    return matches
 
 
 def compute_scores(tool, values):
@@ -1322,7 +1332,7 @@ def main():
 
             updated_conditions = []
             for cidx, cond in enumerate(conditions):
-                ccol0, ccol1, ccol2, ccol3 = st.columns([2, 3, 3, 1])
+                ccol0, ccol1, ccol2, ccol3, ccol4 = st.columns([2, 3, 3, 3, 1])
                 with ccol0:
                     if cidx == 0:
                         join_with_previous = "AND"
@@ -1354,6 +1364,17 @@ def main():
                         cond_input_id = ""
 
                 with ccol2:
+                    cond_op = st.selectbox(
+                        "Operator",
+                        options=["equals", "not_equals"],
+                        index=["equals", "not_equals"].index(
+                            safe_str(cond.get("op", "equals"))
+                        )
+                        if safe_str(cond.get("op", "equals")) in ["equals", "not_equals"]
+                        else 0,
+                        key=f"cond_op_{ridx}_{cidx}",
+                    )
+                with ccol3:
                     options = get_input_options(tool["inputs"], cond_input_id)
                     if options:
                         cond_value = st.selectbox(
@@ -1369,7 +1390,7 @@ def main():
                             key=f"cond_value_{ridx}_{cidx}",
                         )
 
-                with ccol3:
+                with ccol4:
                     if st.button("Remove", key=f"remove_condition_{ridx}_{cidx}"):
                         conditions.pop(cidx)
                         rules[ridx]["conditions"] = conditions
@@ -1380,7 +1401,7 @@ def main():
                 updated_conditions.append(
                     {
                         "input_id": cond_input_id,
-                        "op": "equals",
+                        "op": cond_op,
                         "value": cond_value,
                         "join_with_previous": join_with_previous if cidx > 0 else "AND",
                     }
@@ -1579,9 +1600,13 @@ def main():
 
         st.divider()
         st.subheader("Results")
-        level, message = evaluate_rules(tool, preview_values)
-        if level and message:
-            render_message(level, message)
+        matches = evaluate_rules(tool, preview_values)
+        for match in matches:
+            rule = match["rule"]
+            level = rule.get("level", "info")
+            message = rule.get("message", "")
+            if level and message:
+                render_message(level, message)
 
         if tool.get("scoring_rules"):
             plus, minus, total = compute_scores(tool, preview_values)
