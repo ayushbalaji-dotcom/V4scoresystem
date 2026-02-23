@@ -244,94 +244,14 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         raise RuntimeError("Missing Gemini API key. Add GEMINI_API_KEY to Streamlit secrets.")
     client = genai.Client(api_key=api_key)
 
-    json_schema = {
-        "type": "object",
-        "properties": {
-            "inputs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "type": {"type": "string", "enum": ["select", "number", "text"]},
-                        "options": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["label", "type", "options"],
-                },
-            },
-            "rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                        "message": {"type": "string"},
-                        "condition_operator": {"type": "string", "enum": ["AND", "OR"]},
-                        "conditions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "op": {"type": "string", "enum": ["equals", "not_equals"]},
-                                    "value": {"type": "string"},
-                                },
-                                "required": ["label", "value"],
-                            },
-                        },
-                    },
-                    "required": ["name", "level", "message", "condition_operator", "conditions"],
-                },
-            },
-            "scoring_rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "favor_values": {"type": "array", "items": {"type": "string"}},
-                        "against_values": {"type": "array", "items": {"type": "string"}},
-                        "invert_favor": {"type": "boolean"},
-                        "weight": {"type": "integer"},
-                    },
-                    "required": ["label", "favor_values", "against_values", "invert_favor", "weight"],
-                },
-            },
-            "scoring_recommendations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "min_score": {"type": "integer"},
-                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                        "message": {"type": "string"},
-                        "conditions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "value": {"type": "string"},
-                                },
-                                "required": ["label", "value"],
-                            },
-                        },
-                    },
-                    "required": ["min_score", "level", "message", "conditions"],
-                },
-            },
-        },
-        "required": ["inputs", "rules", "scoring_rules", "scoring_recommendations"],
-    }
-
     scoring_line = (
         "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
         "If scoring_mode is 'signed', you may use both favor_values and against_values."
     )
     system_prompt = (
         "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
-        "Always return valid JSON matching the schema. "
+        "Always return valid JSON in this exact shape: "
+        "{inputs:[], rules:[], scoring_rules:[], scoring_recommendations:[]} with correct fields. "
         "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
@@ -349,7 +269,6 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         contents=[f"{system_prompt}\nscoring_mode={scoring_mode}", text],
         config={
             "response_mime_type": "application/json",
-            "response_json_schema": json_schema,
         },
     )
 
