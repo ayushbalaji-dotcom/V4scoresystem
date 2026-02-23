@@ -1,16 +1,13 @@
 import base64
 import json
+import hashlib
+import mimetypes
 import os
 import re
 import uuid
 from copy import deepcopy
 from typing import Dict, List, Tuple
-from urllib import request, error
-
-try:
-    from google import genai
-except Exception:  # pragma: no cover
-    genai = None
+from urllib import error, request
 
 import streamlit as st
 
@@ -18,22 +15,34 @@ DATA_PATH = os.path.join("data", "tools.json")
 GITHUB_REPO = "ayushbalaji-dotcom/homepagev2"
 GITHUB_BRANCH = "main"
 GITHUB_CALCULATORS_DIR = "calculators"
-
-CATEGORIES = {
-    "Cardiac": ["Coronary", "Aortic", "Tricuspid", "Mitral", "Pulmonary", "Arrhythmia", "Miscellaneous"],
-    "Thoracic": ["Malignant", "Benign"],
-    "Transplant": [],
-}
-GEMINI_MODEL = "gemini-2.5-flash"
+GITHUB_GUIDELINE_DIR = GITHUB_CALCULATORS_DIR
 
 DEFAULT_TOOL = {
     "name": "New Tool",
     "description": "",
-    "inputs": [],
-    "scoring_rules": [],
-    "rules": [],
-    "scoring_recommendations": [],
-    "scoring_mode": "signed",
+    "inputs": [
+        {"id": "example_yes_no", "label": "Example Yes/No?", "type": "select", "options": ["Yes", "No", "Unknown"]}
+    ],
+    "scoring_rules": [
+        {
+            "input_id": "example_yes_no",
+            "favor_values": ["Yes"],
+            "against_values": ["No"],
+            "invert_favor": False,
+            "weight": 1,
+        }
+    ],
+    "rules": [
+        {
+            "name": "Example Rule",
+            "level": "info",
+            "message": "Example: Rule matched",
+            "conditions": [
+                {"input_id": "example_yes_no", "op": "equals", "value": "Yes"}
+            ],
+        }
+    ],
+    "fallback": {"level": "warning", "message": "No rules matched."},
 }
 
 TRICUSPID_TOOL = {
@@ -218,6 +227,23 @@ TRICUSPID_TOOL = {
 LEVELS = ["success", "info", "warning", "error"]
 INPUT_TYPES = ["select", "number", "text"]
 
+def get_github_token():
+    return st.secrets.get("github_token") or os.environ.get("GITHUB_TOKEN")
+
+
+def github_request(method: str, url: str, token: str, payload: dict | None = None):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "calculator-builder",
+        "Authorization": f"Bearer {token}",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = request.Request(url, method=method, headers=headers, data=data)
+    with request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
 
 def load_tools():
     if not os.path.exists(DATA_PATH):
@@ -232,310 +258,6 @@ def save_tools(data):
         json.dump(data, f, indent=2)
 
 
-def get_github_token():
-    return st.secrets.get("github_token") or os.environ.get("GITHUB_TOKEN")
-
-
-def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
-    if genai is None:
-        raise RuntimeError("Google GenAI client not available. Install google-genai.")
-    api_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing Gemini API key. Add GEMINI_API_KEY to Streamlit secrets.")
-    client = genai.Client(api_key=api_key)
-
-    json_schema = {
-        "type": "object",
-        "properties": {
-            "inputs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "type": {"type": "string", "enum": ["select", "number", "text"]},
-                        "options": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["label", "type", "options"],
-                },
-            },
-            "rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                        "message": {"type": "string"},
-                        "condition_operator": {"type": "string", "enum": ["AND", "OR"]},
-                        "conditions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "value": {"type": "string"},
-                                },
-                                "required": ["label", "value"],
-                            },
-                        },
-                    },
-                    "required": ["name", "level", "message", "condition_operator", "conditions"],
-                },
-            },
-            "scoring_rules": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "favor_values": {"type": "array", "items": {"type": "string"}},
-                        "against_values": {"type": "array", "items": {"type": "string"}},
-                        "invert_favor": {"type": "boolean"},
-                        "weight": {"type": "integer"},
-                    },
-                    "required": ["label", "favor_values", "against_values", "invert_favor", "weight"],
-                },
-            },
-            "scoring_recommendations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "min_score": {"type": "integer"},
-                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
-                        "message": {"type": "string"},
-                        "conditions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "value": {"type": "string"},
-                                },
-                                "required": ["label", "value"],
-                            },
-                        },
-                    },
-                    "required": ["min_score", "level", "message", "conditions"],
-                },
-            },
-        },
-        "required": ["inputs", "rules", "scoring_rules", "scoring_recommendations"],
-    }
-
-    scoring_line = (
-        "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
-        "If scoring_mode is 'signed', you may use both favor_values and against_values."
-    )
-    system_prompt = (
-        "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
-        "Always return valid JSON matching the schema. "
-        "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
-        "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
-        "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
-        "Return multiple recommendation rules when the text describes alternatives or exceptions. "
-        "Set condition_operator to 'OR' when the recommendation is triggered by any one condition; otherwise use 'AND'. "
-        "Create scoring rules when you see favorable vs unfavorable factors; otherwise return an empty scoring_rules list. "
-        "If the text describes score thresholds, populate scoring_recommendations with min_score and message. "
-        "If thresholds depend on another factor (e.g., sex), include that as a condition on the scoring_recommendation. "
-        "If the text includes a class label (e.g., Class I, Class IIa, Class 1B), include that phrase in the rule message (and optionally the rule name). "
-        + scoring_line
-    )
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f"{system_prompt}\nscoring_mode={scoring_mode}", text],
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": json_schema,
-        },
-    )
-
-    return json.loads(response.text)
-
-
-def github_request(method: str, url: str, token: str, payload: Dict | None = None):
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "score-builder-v3",
-        "Authorization": f"Bearer {token}",
-    }
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, method=method, headers=headers, data=data)
-    with request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def tool_id_from_github_path(path: str) -> str:
-    return "gh_" + re.sub(r"[^a-zA-Z0-9_]+", "_", path).strip("_").lower()
-
-
-def list_github_calculator_paths(token: str) -> List[str]:
-    def walk(dir_path: str) -> List[str]:
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{dir_path}?ref={GITHUB_BRANCH}"
-        entries = github_request("GET", url, token)
-        paths: List[str] = []
-        if isinstance(entries, dict):
-            entries = [entries]
-        for entry in entries:
-            if entry.get("type") == "dir":
-                paths.extend(walk(entry.get("path", "")))
-            elif entry.get("type") == "file" and safe_str(entry.get("name")).endswith(".json"):
-                paths.append(entry.get("path"))
-        return paths
-
-    return walk(GITHUB_CALCULATORS_DIR)
-
-
-def parse_category_from_github_path(path: str) -> Tuple[str, str]:
-    parts = path.split("/")
-    # calculators/<category>/<subcategory>/<file>.json
-    category = parts[1] if len(parts) >= 3 else "Cardiac"
-    subcategory = parts[2] if len(parts) >= 4 else ""
-    return category, subcategory
-
-
-def sync_tools_from_github(data: Dict) -> Tuple[Dict, int, str]:
-    token = get_github_token()
-    if not token:
-        return data, 0, "Skipping GitHub sync (missing token)."
-
-    try:
-        paths = list_github_calculator_paths(token)
-    except Exception as exc:
-        return data, 0, f"GitHub sync failed: {exc}"
-
-    tools = data.setdefault("tools", {})
-    by_path = {
-        safe_str(t.get("github_path")): tool_id
-        for tool_id, t in tools.items()
-        if safe_str(t.get("github_path"))
-    }
-    synced = 0
-
-    for path in paths:
-        try:
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}"
-            content_obj = github_request("GET", url, token)
-            encoded = safe_str(content_obj.get("content")).replace("\n", "")
-            parsed = json.loads(base64.b64decode(encoded).decode("utf-8"))
-        except Exception:
-            continue
-
-        category, subcategory = parse_category_from_github_path(path)
-        parsed["category"] = category
-        parsed["subcategory"] = subcategory
-        parsed["github_path"] = path
-
-        tool_id = by_path.get(path) or tool_id_from_github_path(path)
-        tools[tool_id] = parsed
-        synced += 1
-
-    return data, synced, f"Synced {synced} calculators from GitHub."
-
-
-def save_tool_to_github(tool: Dict) -> Tuple[bool, str, str]:
-    token = get_github_token()
-    if not token:
-        return False, "Missing GitHub token. Add github_token to Streamlit secrets.", ""
-
-    filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
-    category = safe_str(tool.get("category")) or "Uncategorized"
-    subcategory = safe_str(tool.get("subcategory"))
-    target_path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}" if subcategory else f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
-
-    previous_path = safe_str(tool.get("github_path"))
-    path = previous_path or target_path
-    if previous_path and previous_path != target_path:
-        # Treat category/name change as a move: write new path, then delete old.
-        path = target_path
-
-    if subcategory and not previous_path:
-        path = target_path
-    else:
-        path = target_path
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-
-    existing_sha = None
-    try:
-        existing = github_request("GET", f"{url}?ref={GITHUB_BRANCH}", token)
-        existing_sha = existing.get("sha")
-    except error.HTTPError as exc:
-        if exc.code != 404:
-            return False, f"GitHub lookup failed: {exc}", ""
-
-    content = json.dumps(tool, indent=2).encode("utf-8")
-    payload = {
-        "message": f"Add/Update calculator {filename}",
-        "content": base64.b64encode(content).decode("utf-8"),
-        "branch": GITHUB_BRANCH,
-    }
-    if existing_sha:
-        payload["sha"] = existing_sha
-
-    try:
-        github_request("PUT", url, token, payload)
-        if previous_path and previous_path != target_path:
-            old_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{previous_path}"
-            try:
-                old = github_request("GET", f"{old_url}?ref={GITHUB_BRANCH}", token)
-                old_sha = old.get("sha")
-                if old_sha:
-                    github_request(
-                        "DELETE",
-                        old_url,
-                        token,
-                        {"message": f"Move calculator to {target_path}", "sha": old_sha, "branch": GITHUB_BRANCH},
-                    )
-            except Exception:
-                pass
-        return True, f"Saved to GitHub: {path}", path
-    except error.HTTPError as exc:
-        return False, f"GitHub save failed: {exc}", ""
-
-
-def delete_tool_from_github(tool: Dict) -> Tuple[bool, str]:
-    token = get_github_token()
-    if not token:
-        return False, "Missing GitHub token. Add github_token to Streamlit secrets."
-
-    filename = f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json"
-    category = safe_str(tool.get("category")) or "Uncategorized"
-    subcategory = safe_str(tool.get("subcategory"))
-    path = safe_str(tool.get("github_path"))
-    if not path:
-        if subcategory:
-            path = f"{GITHUB_CALCULATORS_DIR}/{category}/{subcategory}/{filename}"
-        else:
-            path = f"{GITHUB_CALCULATORS_DIR}/{category}/{filename}"
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-
-    try:
-        existing = github_request("GET", f"{url}?ref={GITHUB_BRANCH}", token)
-        existing_sha = existing.get("sha")
-        if not existing_sha:
-            return False, "File not found on GitHub."
-    except error.HTTPError as exc:
-        if exc.code == 404:
-            return False, "File not found on GitHub."
-        return False, f"GitHub lookup failed: {exc}"
-
-    payload = {
-        "message": f"Delete calculator {filename}",
-        "sha": existing_sha,
-        "branch": GITHUB_BRANCH,
-    }
-
-    try:
-        github_request("DELETE", url, token, payload)
-        return True, f"Deleted from GitHub: {path}"
-    except error.HTTPError as exc:
-        return False, f"GitHub delete failed: {exc}"
-
-
 def ensure_state():
     if "tools_data" not in st.session_state:
         st.session_state.tools_data = load_tools()
@@ -543,10 +265,6 @@ def ensure_state():
         if "tricuspid_repair" not in tools:
             tools["tricuspid_repair"] = deepcopy(TRICUSPID_TOOL)
             save_tools(st.session_state.tools_data)
-        st.session_state.tools_data, synced_count, sync_message = sync_tools_from_github(st.session_state.tools_data)
-        st.session_state.github_sync_message = sync_message
-        st.session_state.github_synced_count = synced_count
-        save_tools(st.session_state.tools_data)
     if "selected_tool_id" not in st.session_state:
         tool_ids = list(st.session_state.tools_data.get("tools", {}).keys())
         st.session_state.selected_tool_id = tool_ids[0] if tool_ids else None
@@ -556,10 +274,6 @@ def ensure_state():
         st.session_state.editing_tool_id = None
     if "preview_values" not in st.session_state:
         st.session_state.preview_values = {}
-    if "github_sync_message" not in st.session_state:
-        st.session_state.github_sync_message = ""
-    if "github_synced_count" not in st.session_state:
-        st.session_state.github_synced_count = 0
 
 
 def normalize_options(options_csv):
@@ -580,6 +294,47 @@ def slugify(value: str) -> str:
     value = safe_str(value).lower()
     value = re.sub(r"[^a-z0-9]+", "_", value)
     return value.strip("_")
+
+
+def build_guideline_filename(tool_id: str, tool_name: str, extension: str) -> str:
+    base = slugify(tool_name) or "guideline"
+    ext = (extension or "").lstrip(".") or "png"
+    return f"guideline_{tool_id}_{base}.{ext}"
+
+
+def save_guideline_image_to_github(image_bytes: bytes, filename: str, mime: str):
+    token = get_github_token()
+    if not token:
+        return False, "Missing GitHub token. Add github_token to Streamlit secrets."
+
+    path = f"{GITHUB_GUIDELINE_DIR}/{filename}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    existing_sha = None
+    try:
+        existing = github_request("GET", f"{url}?ref={GITHUB_BRANCH}", token)
+        existing_sha = existing.get("sha")
+    except error.HTTPError as exc:
+        if exc.code != 404:
+            return False, f"GitHub lookup failed: {exc}"
+
+    payload = {
+        "message": f"Add/Update guideline image {filename}",
+        "content": base64.b64encode(image_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    try:
+        github_request("PUT", url, token, payload)
+        return True, {
+            "github_path": path,
+            "raw_url": f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{path}",
+            "mime": mime,
+        }
+    except error.HTTPError as exc:
+        return False, f"GitHub save failed: {exc}"
 
 
 def ensure_input_ids(inputs: List[Dict]) -> List[Dict]:
@@ -607,131 +362,12 @@ def get_input_options(inputs: List[Dict], input_id: str) -> List[str]:
             return item.get("options", []) or []
     return []
 
-
-def questionize_label(label: str) -> str:
-    label = safe_str(label)
-    if not label:
-        return ""
-    if label.endswith("?"):
-        return label
-    starts = label.lower().strip()
-    question_starts = (
-        "what",
-        "which",
-        "when",
-        "how",
-        "is",
-        "are",
-        "does",
-        "do",
-        "did",
-        "has",
-        "have",
-        "was",
-        "were",
-        "can",
-        "should",
-        "could",
-        "would",
-        "will",
-    )
-    if starts.startswith(question_starts):
-        return f"{label}?"
-    return f"Does the patient have {label}?"
-
-
-def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
-    inputs = tool.get("inputs", [])
-    existing_labels = {
-        safe_str(item.get("label")) for item in inputs if safe_str(item.get("label"))
-    }
-
-    for item in parsed.get("inputs", []):
-        label = questionize_label(item.get("label"))
-        if not label or label in existing_labels:
-            continue
-        input_id = slugify(label)
-        inputs.append(
-            {
-                "id": input_id,
-                "label": label,
-                "type": item.get("type", "select"),
-                "options": item.get("options", []),
-            }
-        )
-        existing_labels.add(label)
-
-    tool["inputs"] = inputs
-    id_to_label, label_to_id = build_label_maps(inputs)
-
-    for rule in parsed.get("rules", []):
-        conditions = []
-        for cond in rule.get("conditions", []):
-            label = questionize_label(cond.get("label"))
-            value = safe_str(cond.get("value"))
-            input_id = label_to_id.get(label)
-            if input_id and value:
-                conditions.append({"input_id": input_id, "op": "equals", "value": value})
-
-        if conditions:
-            tool.setdefault("rules", []).append(
-                {
-                    "name": safe_str(rule.get("name")) or "AI Rule",
-                    "level": rule.get("level", "info"),
-                    "message": safe_str(rule.get("message")),
-                    "condition_operator": safe_str(rule.get("condition_operator", "AND")).upper() or "AND",
-                    "conditions": conditions,
-                }
-            )
-
-    scoring_rules = tool.get("scoring_rules", [])
-    for srule in parsed.get("scoring_rules", []):
-        label = questionize_label(srule.get("label"))
-        input_id = label_to_id.get(label)
-        if not input_id:
-            continue
-        scoring_rules.append(
-            {
-                "input_id": input_id,
-                "favor_values": srule.get("favor_values", []),
-                "against_values": srule.get("against_values", []),
-                "invert_favor": bool(srule.get("invert_favor", False)),
-                "weight": int(srule.get("weight", 1) or 1),
-            }
-        )
-    tool["scoring_rules"] = scoring_rules
-
-    scoring_recs = tool.get("scoring_recommendations", [])
-    for item in parsed.get("scoring_recommendations", []):
-        conditions = []
-        for cond in item.get("conditions", []):
-            label = questionize_label(cond.get("label"))
-            value = safe_str(cond.get("value"))
-            input_id = label_to_id.get(label)
-            if input_id and value:
-                conditions.append({"input_id": input_id, "op": "equals", "value": value})
-        try:
-            min_score = int(item.get("min_score"))
-        except (TypeError, ValueError):
-            continue
-        scoring_recs.append(
-            {
-                "min_score": min_score,
-                "level": item.get("level", "info"),
-                "message": safe_str(item.get("message")),
-                "conditions": conditions,
-            }
-        )
-    tool["scoring_recommendations"] = scoring_recs
-
-    return tool
-
-
 def tool_to_input_rows(tool):
     rows = []
     for item in tool.get("inputs", []):
         rows.append(
             {
+                "id": item.get("id", ""),
                 "label": item.get("label", ""),
                 "type": item.get("type", "select"),
                 "options_csv": ", ".join(item.get("options", [])),
@@ -740,22 +376,15 @@ def tool_to_input_rows(tool):
     return rows
 
 
-def input_rows_to_tool(rows, existing_inputs):
+def input_rows_to_tool(rows):
     inputs = []
-    existing_by_label = {
-        safe_str(item.get("label")): safe_str(item.get("id"))
-        for item in existing_inputs
-        if safe_str(item.get("label"))
-    }
     for row in rows:
-        if not row.get("label"):
+        if not row.get("id"):
             continue
-        label = safe_str(row.get("label", ""))
-        input_id = existing_by_label.get(label) or slugify(label)
         inputs.append(
             {
-                "id": input_id,
-                "label": label,
+                "id": safe_str(row.get("id")),
+                "label": safe_str(row.get("label", "")),
                 "type": row.get("type", "select"),
                 "options": normalize_options(row.get("options_csv", "")),
             }
@@ -870,12 +499,16 @@ def render_message(level, message):
 
 
 def evaluate_rules(tool, values):
-    def condition_match(cond: Dict) -> bool:
+    def condition_match(cond):
         input_id = cond.get("input_id")
         expected = cond.get("value")
-        return values.get(input_id) == expected
+        op = safe_str(cond.get("op")) or "equals"
+        actual = values.get(input_id)
+        if op == "not_equals":
+            return actual != expected
+        return actual == expected
 
-    def evaluate_condition_expression(rule: Dict) -> Tuple[bool, int, float, int]:
+    def evaluate_condition_expression(rule):
         conditions = rule.get("conditions", [])
         if not conditions:
             return False, 0, 0.0, 0
@@ -889,7 +522,7 @@ def evaluate_rules(tool, values):
         if first_match:
             matched_count += 1
         current_group = first_match
-        group_results: List[bool] = []
+        group_results = []
 
         for cond in conditions[1:]:
             cond_is_match = condition_match(cond)
@@ -930,16 +563,16 @@ def evaluate_rules(tool, values):
             best_total_conditions = condition_count
             best_match = rule
 
-    if best_match and best_count > 0:
+    if best_match:
         return best_match.get("level", "info"), best_match.get("message", "")
 
-    return None, None
+    fallback = tool.get("fallback", {"level": "warning", "message": "No rules matched."})
+    return fallback.get("level", "warning"), fallback.get("message", "No rules matched.")
 
 
 def compute_scores(tool, values):
     plus = 0
     minus = 0
-    scoring_mode = tool.get("scoring_mode", "signed")
     for rule in tool.get("scoring_rules", []):
         input_id = rule.get("input_id")
         if not input_id:
@@ -956,80 +589,63 @@ def compute_scores(tool, values):
             score = 1 if invert else -1
         if score == 1:
             plus += weight
-        elif score == -1 and scoring_mode == "signed":
+        elif score == -1:
             minus += weight
-    total = plus - minus if scoring_mode == "signed" else plus
-    return plus, minus, total
+    return plus, minus
 
 
-def evaluate_score_recommendation(tool, values, total_score):
-    thresholds = tool.get("scoring_recommendations", [])
-    if not thresholds:
-        return None
-    best = None
-    for item in thresholds:
-        try:
-            min_score = int(item.get("min_score"))
-        except (TypeError, ValueError):
-            continue
-        if total_score >= min_score:
-            conditions = item.get("conditions", [])
-            matched = 0
-            for cond in conditions:
-                input_id = cond.get("input_id")
-                expected = cond.get("value")
-                actual = values.get(input_id)
-                if actual == expected:
-                    matched += 1
-            if conditions and matched != len(conditions):
-                continue
-            ratio = matched / len(conditions) if conditions else 1.0
-            candidate = {
-                "min_score": min_score,
-                "level": item.get("level", "info"),
-                "message": item.get("message", ""),
-                "matched": matched,
-                "ratio": ratio,
-            }
-            if best is None:
-                best = candidate
-            else:
-                if min_score > best.get("min_score", -10**9):
-                    best = candidate
-                elif min_score == best.get("min_score", -10**9) and ratio > best.get("ratio", 0.0):
-                    best = candidate
-    return best
+def build_decision_tree_graph(tool: Dict, id_to_label: Dict[str, str], values: Dict | None = None) -> str:
+    values = values or {}
 
+    def condition_match(cond: Dict) -> bool:
+        input_id = cond.get("input_id")
+        expected = cond.get("value")
+        actual = values.get(input_id)
+        op = safe_str(cond.get("op")) or "equals"
+        if op == "not_equals":
+            return actual != expected
+        return actual == expected
 
-def build_decision_tree_graph(tool: Dict, id_to_label: Dict[str, str]) -> str:
-    lines = ["digraph DecisionTree {", 'rankdir=LR;', 'node [shape=box, style="rounded"];']
-    lines.append('start [label="Start"];')
+    lines = [
+        "digraph DecisionTree {",
+        'rankdir=LR;',
+        'node [shape=box, style="rounded,filled", color="gray35", fillcolor="white"];',
+    ]
+    lines.append('start [label="Start", shape=oval, fillcolor="white"];')
     for ridx, rule in enumerate(tool.get("rules", [])):
+        conditions = rule.get("conditions", [])
         rule_node = f"rule_{ridx}"
         rule_label = safe_str(rule.get("name")) or f"Rule {ridx + 1}"
-        lines.append(f'{rule_node} [label="{rule_label}"];')
+        rule_match = all(condition_match(c) for c in conditions) if conditions else False
+        rule_attrs = 'fillcolor="white"'
+        if rule_match:
+            rule_attrs = 'fillcolor="lightyellow", color="goldenrod"'
+        lines.append(f'{rule_node} [label="{rule_label}", {rule_attrs}];')
         lines.append(f"start -> {rule_node};")
 
         prev_node = rule_node
-        for cidx, cond in enumerate(rule.get("conditions", [])):
+        for cidx, cond in enumerate(conditions):
             cond_node = f"rule_{ridx}_cond_{cidx}"
             input_label = id_to_label.get(cond.get("input_id", ""), cond.get("input_id", ""))
             value = safe_str(cond.get("value"))
-            cond_label = f"{input_label} = {value}".replace('"', "'")
-            lines.append(f'{cond_node} [label="{cond_label}"];')
-            edge_label = ""
-            if cidx > 0:
-                edge_label = safe_str(cond.get("join_with_previous", "AND")).upper()
-            if edge_label:
-                lines.append(f'{prev_node} -> {cond_node} [label="{edge_label}"];')
-            else:
-                lines.append(f"{prev_node} -> {cond_node};")
+            op = safe_str(cond.get("op")) or "equals"
+            operator_label = "!=" if op == "not_equals" else "="
+            cond_label = f"{input_label} {operator_label} {value}".replace('"', "'")
+            matched = condition_match(cond)
+            cond_attrs = 'fillcolor="white"'
+            if values and matched:
+                cond_attrs = 'fillcolor="palegreen", color="green"'
+            lines.append(f'{cond_node} [label="{cond_label}", {cond_attrs}];')
+            lines.append(f"{prev_node} -> {cond_node};")
             prev_node = cond_node
 
         out_node = f"rule_{ridx}_out"
         msg = safe_str(rule.get("message")) or "Recommendation"
         msg = msg.replace('"', "'")
-        lines.append(f'{out_node} [shape=note, label="{msg}"];')
+        out_attrs = 'fillcolor="white"'
+        if rule_match:
+            out_attrs = 'fillcolor="lightblue", color="dodgerblue4"'
+        lines.append(f'{out_node} [shape=note, label="{msg}", {out_attrs}];')
         lines.append(f"{prev_node} -> {out_node};")
 
     lines.append("}")
@@ -1047,18 +663,18 @@ def main():
         st.subheader("Tools")
         tool_items = st.session_state.tools_data.get("tools", {})
         tool_ids = list(tool_items.keys())
+        tool_labels = [tool_items[tool_id]["name"] for tool_id in tool_ids]
 
         if tool_ids:
             previous_selection = st.session_state.selected_tool_id
-            selected_id = st.selectbox(
+            selected_label = st.selectbox(
                 "Select tool",
-                options=tool_ids,
+                options=tool_labels,
                 index=tool_ids.index(st.session_state.selected_tool_id)
                 if st.session_state.selected_tool_id in tool_ids
                 else 0,
-                format_func=lambda tid: tool_items[tid].get("name", tid),
             )
-            st.session_state.selected_tool_id = selected_id
+            st.session_state.selected_tool_id = tool_ids[tool_labels.index(selected_label)]
             if st.session_state.selected_tool_id != previous_selection:
                 st.session_state.editing_tool = None
                 st.session_state.editing_tool_id = None
@@ -1078,16 +694,6 @@ def main():
             save_tools(st.session_state.tools_data)
             st.session_state.selected_tool_id = "tricuspid_repair"
             st.rerun()
-
-        if st.button("Sync from GitHub"):
-            st.session_state.tools_data, synced_count, sync_message = sync_tools_from_github(st.session_state.tools_data)
-            st.session_state.github_synced_count = synced_count
-            st.session_state.github_sync_message = sync_message
-            save_tools(st.session_state.tools_data)
-            st.rerun()
-
-        if st.session_state.github_sync_message:
-            st.caption(st.session_state.github_sync_message)
 
         if tool_ids:
             if st.button("Delete Tool"):
@@ -1109,90 +715,119 @@ def main():
         st.subheader("Tool Details")
         tool["name"] = st.text_input("Tool name", value=tool.get("name", ""))
         tool["description"] = st.text_area("Description", value=tool.get("description", ""))
-        col_a, col_b = st.columns(2)
-        with col_a:
-            category = st.selectbox(
-                "Section",
-                options=list(CATEGORIES.keys()),
-                index=list(CATEGORIES.keys()).index(tool.get("category", "Cardiac"))
-                if tool.get("category", "Cardiac") in CATEGORIES
-                else 0,
-            )
-        with col_b:
-            subcats = CATEGORIES.get(category, [])
-            if subcats:
-                subcategory = st.selectbox(
-                    "Subsection",
-                    options=subcats,
-                    index=subcats.index(tool.get("subcategory", subcats[0]))
-                    if tool.get("subcategory") in subcats
-                    else 0,
-                )
-            else:
-                subcategory = ""
-                st.text_input("Subsection", value="(none)", disabled=True)
-        tool["category"] = category
-        tool["subcategory"] = subcategory
-        scoring_mode = st.selectbox(
-            "Scoring mode",
-            ["signed", "positive-only"],
-            index=["signed", "positive-only"].index(tool.get("scoring_mode", "signed")),
-            format_func=lambda x: "Signed (favor + / against -)" if x == "signed" else "Positive-only (no negatives)",
-        )
-        tool["scoring_mode"] = scoring_mode
 
         st.divider()
         st.subheader("Guideline Image")
         st.caption("Optional. This image will be shown at the bottom of the guideline table.")
-        image_upload = st.file_uploader("Upload guideline image", type=["png", "jpg", "jpeg", "gif"], key=f"guideline_image_{st.session_state.selected_tool_id}")
+        image_upload = st.file_uploader("Upload guideline image", type=["png", "jpg", "jpeg", "gif"])
+        if "guideline_upload_keys" not in st.session_state:
+            st.session_state.guideline_upload_keys = {}
         if image_upload is not None:
             image_bytes = image_upload.getvalue()
-            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
             mime = image_upload.type or "image/png"
-            tool["guideline_image"] = f"data:{mime};base64,{image_b64}"
-            st.session_state.editing_tool = tool
-            st.success("Image attached to this tool.")
-        if tool.get("guideline_image"):
-            st.image(tool["guideline_image"], use_container_width=True)
-
-        st.divider()
-        st.subheader("Free-Text Rule Builder (AI)")
-        st.caption("Paste a guideline sentence and let AI propose inputs + a rule. You can edit afterwards.")
-        free_text = st.text_area(
-            "Rule text",
-            value=st.session_state.get("free_text_rule", ""),
-            key="free_text_rule",
-            height=120,
-        )
-        scoring_hint = st.selectbox(
-            "Scoring style for AI parser",
-            ["signed", "positive-only"],
-            index=["signed", "positive-only"].index(tool.get("scoring_mode", "signed")),
-            format_func=lambda x: "Signed (favor + / against -)" if x == "signed" else "Positive-only (no negatives)",
-        )
-        if st.button("Parse with AI"):
-            try:
-                parsed = parse_free_text_rule(free_text, scoring_hint)
-                tool = merge_ai_result(tool, parsed)
-                st.session_state.editing_tool = tool
-                st.success("AI rule added. Review below.")
-            except Exception as exc:
-                st.error(f"AI parse failed: {exc}")
+            file_ext = os.path.splitext(image_upload.name or "")[1].lstrip(".")
+            if not file_ext:
+                guessed_ext = mimetypes.guess_extension(mime) or ".png"
+                file_ext = guessed_ext.lstrip(".")
+            image_hash = hashlib.md5(image_bytes).hexdigest()
+            upload_key = f"{st.session_state.selected_tool_id}:{image_hash}"
+            if st.session_state.guideline_upload_keys.get(st.session_state.selected_tool_id) != upload_key:
+                filename = build_guideline_filename(
+                    st.session_state.selected_tool_id, tool.get("name", ""), file_ext
+                )
+                ok, result = save_guideline_image_to_github(image_bytes, filename, mime)
+                if ok:
+                    tool["guideline_image"] = result
+                    st.session_state.guideline_upload_keys[st.session_state.selected_tool_id] = upload_key
+                    st.success("Image uploaded to GitHub.")
+                else:
+                    st.warning(result)
+            else:
+                st.caption("Image already uploaded.")
+            st.image(image_bytes, use_container_width=True)
+        elif tool.get("guideline_image"):
+            image_to_show = tool.get("guideline_image")
+            if isinstance(image_to_show, dict):
+                image_to_show = image_to_show.get("raw_url") or image_to_show.get("url")
+            if image_to_show:
+                st.image(image_to_show, use_container_width=True)
 
         st.divider()
         st.subheader("Inputs")
-        input_rows = tool_to_input_rows(tool)
-        input_rows = st.data_editor(
-            input_rows,
-            num_rows="dynamic",
-            column_config={
-                "label": st.column_config.TextColumn("Label"),
-                "type": st.column_config.SelectboxColumn("Type", options=INPUT_TYPES),
-                "options_csv": st.column_config.TextColumn("Options (comma-separated)"),
-            },
-            key="inputs_editor",
-        )
-        tool["inputs"] = input_rows_to_tool(input_rows, tool.get("inputs", []))
+        inputs = ensure_input_ids(tool.get("inputs", []))
+        if st.button("Add Input"):
+            inputs.append(
+                {
+                    "id": "",
+                    "label": "",
+                    "type": "select",
+                    "options": [],
+                }
+            )
+            st.rerun()
+
+        updated_inputs = []
+        for idx, item in enumerate(inputs):
+            label_value = safe_str(item.get("label"))
+            with st.expander(label_value or f"Input {idx + 1}", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    label_value = st.text_input(
+                        "Label",
+                        value=label_value,
+                        key=f"input_label_{idx}",
+                    )
+                    input_type = st.selectbox(
+                        "Type",
+                        options=INPUT_TYPES,
+                        index=INPUT_TYPES.index(item.get("type", "select")),
+                        key=f"input_type_{idx}",
+                    )
+                with col2:
+                    auto_key = f"input_auto_{idx}"
+                    if auto_key not in st.session_state:
+                        st.session_state[auto_key] = not safe_str(item.get("id"))
+                    auto_id = st.checkbox(
+                        "Auto-generate ID from label",
+                        value=st.session_state[auto_key],
+                        key=auto_key,
+                    )
+                    if auto_id:
+                        input_id = slugify(label_value)
+                        st.text_input("ID", value=input_id, disabled=True, key=f"input_id_{idx}")
+                    else:
+                        input_id = st.text_input(
+                            "ID",
+                            value=safe_str(item.get("id")),
+                            key=f"input_id_{idx}",
+                        )
+
+                options = item.get("options", [])
+                if input_type == "select":
+                    options_csv = st.text_input(
+                        "Options (comma-separated)",
+                        value=", ".join(options),
+                        key=f"input_opts_{idx}",
+                    )
+                    options = normalize_options(options_csv)
+                else:
+                    st.caption("Options apply to select inputs only.")
+                    options = []
+
+                if st.button("Delete Input", key=f"delete_input_{idx}"):
+                    inputs.pop(idx)
+                    st.rerun()
+
+                updated_inputs.append(
+                    {
+                        "id": safe_str(input_id),
+                        "label": safe_str(label_value),
+                        "type": input_type,
+                        "options": options,
+                    }
+                )
+
+        tool["inputs"] = updated_inputs
 
         id_to_label, label_to_id = build_label_maps(tool["inputs"])
         label_options = list(id_to_label.values())
@@ -1210,15 +845,11 @@ def main():
                     "weight": 1,
                 }
             )
-            tool["scoring_rules"] = scoring_rules
-            st.session_state.editing_tool = tool
             st.rerun()
 
-        st.markdown("**Input / Favor / Against / Invert / Weight**")
         updated_scoring = []
         for idx, rule in enumerate(scoring_rules):
-            cols = st.columns([3, 3, 3, 2, 2, 1])
-            with cols[0]:
+            with st.expander(f"Scoring Rule {idx + 1}", expanded=True):
                 selected_label = id_to_label.get(rule.get("input_id", ""), "")
                 if label_options:
                     selected_label = st.selectbox(
@@ -1229,33 +860,27 @@ def main():
                     )
                     input_id = label_to_id.get(selected_label, "")
                 else:
-                    st.warning("Add inputs first.")
+                    st.warning("Add inputs first to define scoring rules.")
                     input_id = ""
-            with cols[1]:
+
                 options = get_input_options(tool["inputs"], input_id)
-                default_favor = [v for v in rule.get("favor_values", []) if v in options]
                 favor_values = st.multiselect(
                     "Favor values",
                     options=options,
-                    default=default_favor,
+                    default=rule.get("favor_values", []),
                     key=f"score_favor_{idx}",
                 )
-            with cols[2]:
-                options = get_input_options(tool["inputs"], input_id)
-                default_against = [v for v in rule.get("against_values", []) if v in options]
                 against_values = st.multiselect(
                     "Against values",
                     options=options,
-                    default=default_against,
+                    default=rule.get("against_values", []),
                     key=f"score_against_{idx}",
                 )
-            with cols[3]:
                 invert_favor = st.checkbox(
-                    "Invert",
+                    "Invert (yes counts against)",
                     value=bool(rule.get("invert_favor", False)),
                     key=f"score_invert_{idx}",
                 )
-            with cols[4]:
                 weight = st.number_input(
                     "Weight",
                     min_value=1,
@@ -1263,22 +888,20 @@ def main():
                     value=int(rule.get("weight", 1) or 1),
                     key=f"score_weight_{idx}",
                 )
-            with cols[5]:
-                if st.button("Remove", key=f"delete_score_{idx}"):
+
+                if st.button("Delete Scoring Rule", key=f"delete_score_{idx}"):
                     scoring_rules.pop(idx)
-                    tool["scoring_rules"] = scoring_rules
-                    st.session_state.editing_tool = tool
                     st.rerun()
 
-            updated_scoring.append(
-                {
-                    "input_id": input_id,
-                    "favor_values": favor_values,
-                    "against_values": against_values,
-                    "invert_favor": invert_favor,
-                    "weight": weight,
-                }
-            )
+                updated_scoring.append(
+                    {
+                        "input_id": input_id,
+                        "favor_values": favor_values,
+                        "against_values": against_values,
+                        "invert_favor": invert_favor,
+                        "weight": weight,
+                    }
+                )
 
         tool["scoring_rules"] = updated_scoring
 
@@ -1291,270 +914,98 @@ def main():
                     "name": "",
                     "level": "info",
                     "message": "",
-                    "condition_operator": "AND",
                     "conditions": [],
                 }
             )
-            tool["rules"] = rules
-            st.session_state.editing_tool = tool
             st.rerun()
 
         updated_rules = []
         for ridx, rule in enumerate(rules):
-            st.markdown(f"**Rule {ridx + 1}**")
-            rcol1, rcol2 = st.columns([2, 1])
-            with rcol1:
+            with st.expander(rule.get("name") or f"Rule {ridx + 1}", expanded=True):
                 name = st.text_input("Rule name", value=rule.get("name", ""), key=f"rule_name_{ridx}")
-            with rcol2:
                 level = st.selectbox(
                     "Level",
                     options=LEVELS,
                     index=LEVELS.index(rule.get("level", "info")),
                     key=f"rule_level_{ridx}",
                 )
-            condition_operator = st.selectbox(
-                "Condition logic",
-                options=["AND", "OR"],
-                index=["AND", "OR"].index(safe_str(rule.get("condition_operator", "AND")).upper())
-                if safe_str(rule.get("condition_operator", "AND")).upper() in ["AND", "OR"]
-                else 0,
-                key=f"rule_op_{ridx}",
-            )
-            message = st.text_area(
-                "Message",
-                value=rule.get("message", ""),
-                key=f"rule_message_{ridx}",
-            )
+                message = st.text_area(
+                    "Message",
+                    value=rule.get("message", ""),
+                    key=f"rule_message_{ridx}",
+                )
 
-            st.markdown("**Conditions**")
-            conditions = rule.get("conditions", [])
-            if st.button("Add Condition", key=f"add_condition_{ridx}"):
-                conditions.append({"input_id": "", "op": "equals", "value": ""})
-                rules[ridx]["conditions"] = conditions
-                tool["rules"] = rules
-                st.session_state.editing_tool = tool
-                st.rerun()
+                st.markdown("**Conditions**")
+                conditions = rule.get("conditions", [])
+                if st.button("Add Condition", key=f"add_condition_{ridx}"):
+                    conditions.append({"input_id": "", "op": "equals", "value": ""})
+                    st.rerun()
 
-            updated_conditions = []
-            for cidx, cond in enumerate(conditions):
-                ccol0, ccol1, ccol2, ccol3 = st.columns([2, 3, 3, 1])
-                with ccol0:
-                    if cidx == 0:
-                        join_with_previous = "AND"
-                        st.text_input("Join", value="START", disabled=True, key=f"cond_join_{ridx}_{cidx}_label")
-                    else:
-                        join_with_previous = st.selectbox(
-                            "Join",
-                            options=["AND", "OR"],
-                            index=["AND", "OR"].index(
-                                safe_str(cond.get("join_with_previous", "AND")).upper()
+                updated_conditions = []
+                for cidx, cond in enumerate(conditions):
+                    ccol1, ccol2, ccol3 = st.columns([3, 3, 1])
+                    with ccol1:
+                        if label_options:
+                            cond_label = id_to_label.get(cond.get("input_id", ""), "")
+                            cond_label = st.selectbox(
+                                "Input",
+                                options=label_options,
+                                index=label_options.index(cond_label) if cond_label in label_options else 0,
+                                key=f"cond_input_{ridx}_{cidx}",
                             )
-                            if safe_str(cond.get("join_with_previous", "AND")).upper() in ["AND", "OR"]
-                            else 0,
-                            key=f"cond_join_{ridx}_{cidx}",
-                        )
+                            cond_input_id = label_to_id.get(cond_label, "")
+                        else:
+                            st.warning("Add inputs first to define conditions.")
+                            cond_input_id = ""
+                    with ccol2:
+                        options = get_input_options(tool["inputs"], cond_input_id)
+                        if options:
+                            cond_value = st.selectbox(
+                                "Value",
+                                options=options,
+                                index=options.index(cond.get("value")) if cond.get("value") in options else 0,
+                                key=f"cond_value_{ridx}_{cidx}",
+                            )
+                        else:
+                            cond_value = st.text_input(
+                                "Value",
+                                value=safe_str(cond.get("value")),
+                                key=f"cond_value_{ridx}_{cidx}",
+                            )
+                    with ccol3:
+                        if st.button("Remove", key=f"remove_condition_{ridx}_{cidx}"):
+                            conditions.pop(cidx)
+                            st.rerun()
 
-                with ccol1:
-                    if label_options:
-                        cond_label = id_to_label.get(cond.get("input_id", ""), "")
-                        cond_label = st.selectbox(
-                            "Input",
-                            options=label_options,
-                            index=label_options.index(cond_label) if cond_label in label_options else 0,
-                            key=f"cond_input_{ridx}_{cidx}",
-                        )
-                        cond_input_id = label_to_id.get(cond_label, "")
-                    else:
-                        st.warning("Add inputs first.")
-                        cond_input_id = ""
+                    updated_conditions.append(
+                        {"input_id": cond_input_id, "op": "equals", "value": cond_value}
+                    )
 
-                with ccol2:
-                    options = get_input_options(tool["inputs"], cond_input_id)
-                    if options:
-                        cond_value = st.selectbox(
-                            "Value",
-                            options=options,
-                            index=options.index(cond.get("value")) if cond.get("value") in options else 0,
-                            key=f"cond_value_{ridx}_{cidx}",
-                        )
-                    else:
-                        cond_value = st.text_input(
-                            "Value",
-                            value=safe_str(cond.get("value")),
-                            key=f"cond_value_{ridx}_{cidx}",
-                        )
+                if st.button("Delete Recommendation Rule", key=f"delete_rule_{ridx}"):
+                    rules.pop(ridx)
+                    st.rerun()
 
-                with ccol3:
-                    if st.button("Remove", key=f"remove_condition_{ridx}_{cidx}"):
-                        conditions.pop(cidx)
-                        rules[ridx]["conditions"] = conditions
-                        tool["rules"] = rules
-                        st.session_state.editing_tool = tool
-                        st.rerun()
-
-                updated_conditions.append(
+                updated_rules.append(
                     {
-                        "input_id": cond_input_id,
-                        "op": "equals",
-                        "value": cond_value,
-                        "join_with_previous": join_with_previous if cidx > 0 else "AND",
+                        "name": name,
+                        "level": level,
+                        "message": message,
+                        "conditions": updated_conditions,
                     }
                 )
 
-            if st.button("Delete Recommendation Rule", key=f"delete_rule_{ridx}"):
-                rules.pop(ridx)
-                tool["rules"] = rules
-                st.session_state.editing_tool = tool
-                st.rerun()
-
-            updated_rules.append(
-                {
-                    "name": name,
-                    "level": level,
-                    "message": message,
-                    "condition_operator": condition_operator,
-                    "conditions": updated_conditions,
-                }
-            )
-
         tool["rules"] = updated_rules
 
-        st.divider()
-        st.subheader("Score-Based Recommendation")
-        st.caption("Optional: show a recommendation based on total score thresholds.")
-        scoring_recs = tool.get("scoring_recommendations", [])
-        if st.button("Add Score Threshold"):
-            scoring_recs.append({"min_score": 0, "level": "info", "message": ""})
-            tool["scoring_recommendations"] = scoring_recs
-            st.session_state.editing_tool = tool
-            st.rerun()
-
-        updated_scoring_recs = []
-        for sidx, item in enumerate(scoring_recs):
-            cols = st.columns([2, 2, 6, 1])
-            with cols[0]:
-                min_score = st.number_input(
-                    "Min score",
-                    value=int(item.get("min_score", 0) or 0),
-                    step=1,
-                    key=f"score_min_{sidx}",
-                )
-            with cols[1]:
-                level = st.selectbox(
-                    "Level",
-                    options=LEVELS,
-                    index=LEVELS.index(item.get("level", "info")),
-                    key=f"score_level_{sidx}",
-                )
-            with cols[2]:
-                message = st.text_input(
-                    "Message",
-                    value=item.get("message", ""),
-                    key=f"score_msg_{sidx}",
-                )
-            with cols[3]:
-                if st.button("Remove", key=f"score_remove_{sidx}"):
-                    scoring_recs.pop(sidx)
-                    tool["scoring_recommendations"] = scoring_recs
-                    st.session_state.editing_tool = tool
-                    st.rerun()
-
-            conditions = item.get("conditions", [])
-            if st.button("Add Condition", key=f"score_add_cond_{sidx}"):
-                conditions.append({"input_id": "", "op": "equals", "value": ""})
-                item["conditions"] = conditions
-                tool["scoring_recommendations"] = scoring_recs
-                st.session_state.editing_tool = tool
-                st.rerun()
-
-            updated_conditions = []
-            for cidx, cond in enumerate(conditions):
-                ccol1, ccol2, ccol3 = st.columns([3, 3, 1])
-                with ccol1:
-                    if label_options:
-                        cond_label = id_to_label.get(cond.get("input_id", ""), "")
-                        cond_label = st.selectbox(
-                            "Input",
-                            options=label_options,
-                            index=label_options.index(cond_label) if cond_label in label_options else 0,
-                            key=f"score_cond_input_{sidx}_{cidx}",
-                        )
-                        cond_input_id = label_to_id.get(cond_label, "")
-                    else:
-                        st.warning("Add inputs first.")
-                        cond_input_id = ""
-                with ccol2:
-                    options = get_input_options(tool["inputs"], cond_input_id)
-                    if options:
-                        cond_value = st.selectbox(
-                            "Value",
-                            options=options,
-                            index=options.index(cond.get("value")) if cond.get("value") in options else 0,
-                            key=f"score_cond_value_{sidx}_{cidx}",
-                        )
-                    else:
-                        cond_value = st.text_input(
-                            "Value",
-                            value=safe_str(cond.get("value")),
-                            key=f"score_cond_value_{sidx}_{cidx}",
-                        )
-                with ccol3:
-                    if st.button("Remove", key=f"score_cond_remove_{sidx}_{cidx}"):
-                        conditions.pop(cidx)
-                        item["conditions"] = conditions
-                        tool["scoring_recommendations"] = scoring_recs
-                        st.session_state.editing_tool = tool
-                        st.rerun()
-
-                updated_conditions.append(
-                    {"input_id": cond_input_id, "op": "equals", "value": cond_value}
-                )
-
-            updated_scoring_recs.append(
-                {
-                    "min_score": int(min_score),
-                    "level": level,
-                    "message": message,
-                    "conditions": updated_conditions,
-                }
-            )
-
-        tool["scoring_recommendations"] = updated_scoring_recs
+        st.subheader("Fallback Message")
+        fallback_level = st.selectbox("Fallback level", LEVELS, index=LEVELS.index(tool.get("fallback", {}).get("level", "warning")))
+        fallback_message = st.text_input("Fallback message", value=tool.get("fallback", {}).get("message", "No rules matched."))
+        tool["fallback"] = {"level": fallback_level, "message": fallback_message}
 
         st.divider()
         if st.button("Save Tool"):
-            ok, message, github_path = save_tool_to_github(tool)
-            if github_path:
-                tool["github_path"] = github_path
             st.session_state.tools_data["tools"][st.session_state.selected_tool_id] = deepcopy(tool)
             save_tools(st.session_state.tools_data)
             st.success("Tool saved.")
-            if ok:
-                st.success(message)
-            else:
-                st.warning(message)
-
-        st.divider()
-        st.subheader("Delete Calculator")
-        confirm_delete = st.checkbox("I understand this will delete the calculator from GitHub")
-        if st.button("Delete from GitHub"):
-            if not confirm_delete:
-                st.warning("Please confirm deletion first.")
-            else:
-                ok, message = delete_tool_from_github(tool)
-                if ok:
-                    st.success(message)
-                    current_id = st.session_state.selected_tool_id
-                    if current_id in st.session_state.tools_data.get("tools", {}):
-                        del st.session_state.tools_data["tools"][current_id]
-                        save_tools(st.session_state.tools_data)
-                        remaining_ids = list(st.session_state.tools_data.get("tools", {}).keys())
-                        st.session_state.selected_tool_id = remaining_ids[0] if remaining_ids else None
-                        st.session_state.editing_tool = None
-                        st.session_state.editing_tool_id = None
-                        st.rerun()
-                else:
-                    st.warning(message)
         st.download_button(
             "Download Tool JSON",
             data=json.dumps(tool, indent=2),
@@ -1595,30 +1046,24 @@ def main():
         st.divider()
         st.subheader("Results")
         level, message = evaluate_rules(tool, preview_values)
-        if level and message:
-            render_message(level, message)
+        render_message(level, message)
 
-        if tool.get("scoring_rules"):
-            plus, minus, total = compute_scores(tool, preview_values)
-            score_reco = evaluate_score_recommendation(tool, preview_values, total)
-            if score_reco:
-                render_message(score_reco.get("level", "info"), score_reco.get("message", ""))
-                st.write(f"**Score:** {total}")
-            else:
-                if tool.get("scoring_mode", "signed") == "signed":
-                    st.write(f"✅ **Factors favoring intervention:** {plus}")
-                    st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
-                else:
-                    st.write(f"**Score:** {total}")
+        plus, minus = compute_scores(tool, preview_values)
+        st.write(f"✅ **Factors favoring intervention:** {plus}")
+        st.write(f"❌ **Factors NOT favoring intervention:** {minus}")
 
-        if st.checkbox("Show decision tree", key="show_decision_tree"):
+        if st.checkbox("Show decision tree", key=f"show_decision_tree_{st.session_state.selected_tool_id}"):
             id_to_label, _ = build_label_maps(tool.get("inputs", []))
-            st.graphviz_chart(build_decision_tree_graph(tool, id_to_label))
+            st.graphviz_chart(build_decision_tree_graph(tool, id_to_label, preview_values))
 
         if tool.get("guideline_image"):
             st.divider()
             st.subheader("Guideline Table Image")
-            st.image(tool["guideline_image"], use_container_width=True)
+            image_to_show = tool.get("guideline_image")
+            if isinstance(image_to_show, dict):
+                image_to_show = image_to_show.get("raw_url") or image_to_show.get("url")
+            if image_to_show:
+                st.image(image_to_show, use_container_width=True)
 
 
 if __name__ == "__main__":
