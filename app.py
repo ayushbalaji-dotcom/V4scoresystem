@@ -248,10 +248,9 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         "If scoring_mode is 'positive-only', do not create against_values; use only favor_values. "
         "If scoring_mode is 'signed', you may use both favor_values and against_values."
     )
-    system_prompt = (
+    base_prompt = (
         "You convert free-text clinical decision rules into structured inputs, scoring rules, and recommendation rules. "
-        "Always return valid JSON in this exact shape: "
-        "{inputs:[], rules:[], scoring_rules:[], scoring_recommendations:[]} with correct fields. "
+        "Always return valid JSON in the requested shape. "
         "Use select inputs with options ['Yes','No','Unknown'] for boolean concepts. "
         "If the text mentions severity (mild/moderate/severe), create a select input with those options. "
         "All labels must be phrased as questions (e.g., 'Does the patient have atrial fibrillation?'). "
@@ -264,15 +263,119 @@ def parse_free_text_rule(text: str, scoring_mode: str) -> Dict:
         + scoring_line
     )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f"{system_prompt}\nscoring_mode={scoring_mode}", text],
-        config={
-            "response_mime_type": "application/json",
+    schema_inputs_rules = {
+        "type": "object",
+        "properties": {
+            "inputs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "type": {"type": "string", "enum": ["select", "number", "text"]},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["label", "type", "options"],
+                },
+            },
+            "rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
+                        "message": {"type": "string"},
+                        "condition_operator": {"type": "string", "enum": ["AND", "OR"]},
+                        "conditions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "op": {"type": "string", "enum": ["equals", "not_equals"]},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["label", "value"],
+                            },
+                        },
+                    },
+                    "required": ["name", "level", "message", "condition_operator", "conditions"],
+                },
+            },
         },
+        "required": ["inputs", "rules"],
+    }
+
+    schema_scoring = {
+        "type": "object",
+        "properties": {
+            "scoring_rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "favor_values": {"type": "array", "items": {"type": "string"}},
+                        "against_values": {"type": "array", "items": {"type": "string"}},
+                        "invert_favor": {"type": "boolean"},
+                        "weight": {"type": "integer"},
+                    },
+                    "required": ["label", "favor_values", "against_values", "invert_favor", "weight"],
+                },
+            },
+            "scoring_recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "min_score": {"type": "integer"},
+                        "level": {"type": "string", "enum": ["success", "info", "warning", "error"]},
+                        "message": {"type": "string"},
+                        "conditions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["label", "value"],
+                            },
+                        },
+                    },
+                    "required": ["min_score", "level", "message", "conditions"],
+                },
+            },
+        },
+        "required": ["scoring_rules", "scoring_recommendations"],
+    }
+
+    response_inputs = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[f"{base_prompt}\nscoring_mode={scoring_mode}\nReturn only inputs and rules.", text],
+        config={"response_mime_type": "application/json", "response_json_schema": schema_inputs_rules},
+    )
+    response_scoring = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[f"{base_prompt}\nscoring_mode={scoring_mode}\nReturn only scoring_rules and scoring_recommendations.", text],
+        config={"response_mime_type": "application/json", "response_json_schema": schema_scoring},
     )
 
-    return json.loads(response.text)
+    parsed_inputs = json.loads(response_inputs.text)
+    parsed_scoring = json.loads(response_scoring.text)
+
+    if not isinstance(parsed_inputs, dict):
+        parsed_inputs = {}
+    if not isinstance(parsed_scoring, dict):
+        parsed_scoring = {}
+
+    return {
+        "inputs": parsed_inputs.get("inputs", []) if isinstance(parsed_inputs.get("inputs", []), list) else [],
+        "rules": parsed_inputs.get("rules", []) if isinstance(parsed_inputs.get("rules", []), list) else [],
+        "scoring_rules": parsed_scoring.get("scoring_rules", []) if isinstance(parsed_scoring.get("scoring_rules", []), list) else [],
+        "scoring_recommendations": parsed_scoring.get("scoring_recommendations", []) if isinstance(parsed_scoring.get("scoring_recommendations", []), list) else [],
+    }
 
 
 def github_request(method: str, url: str, token: str, payload: Dict | None = None):
