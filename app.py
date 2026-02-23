@@ -921,7 +921,7 @@ def main():
         st.download_button(
             "Download Tool JSON",
             data=json.dumps(tool, indent=2),
-            file_name=f\"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json\",
+            file_name=f"{safe_str(tool.get('name','tool')).replace(' ', '_').lower() or 'tool'}.json",
             mime="application/json",
         )
 
