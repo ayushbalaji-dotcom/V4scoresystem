@@ -937,34 +937,31 @@ def evaluate_rules(tool, values):
         ratio = matched_count / len(conditions)
         return is_match, matched_count, ratio, len(conditions)
 
-    matches = []
+    best_match = None
+    best_count = 0
+    best_ratio = 0.0
+    best_total_conditions = 0
     for rule in tool.get("rules", []):
         is_match, matched, ratio, condition_count = evaluate_condition_expression(rule)
         if not is_match:
             continue
-        matches.append(
-            {
-                "rule": rule,
-                "matched": matched,
-                "ratio": ratio,
-                "condition_count": condition_count,
-            }
-        )
+        if ratio == 1.0 and best_ratio == 1.0:
+            if condition_count > best_total_conditions:
+                best_count = matched
+                best_ratio = ratio
+                best_total_conditions = condition_count
+                best_match = rule
+                continue
+        if matched > best_count or (matched == best_count and ratio > best_ratio):
+            best_count = matched
+            best_ratio = ratio
+            best_total_conditions = condition_count
+            best_match = rule
 
-    if not matches:
-        return []
+    if best_match and best_count > 0:
+        return best_match.get("level", "info"), best_match.get("message", "")
 
-    # Sort by full match first, then matched count, then ratio, then specificity.
-    matches.sort(
-        key=lambda m: (
-            1 if m["ratio"] == 1.0 else 0,
-            m["matched"],
-            m["ratio"],
-            m["condition_count"],
-        ),
-        reverse=True,
-    )
-    return matches
+    return None, None
 
 
 def compute_scores(tool, values):
@@ -1622,13 +1619,9 @@ def main():
 
         st.divider()
         st.subheader("Results")
-        matches = evaluate_rules(tool, preview_values)
-        for match in matches:
-            rule = match["rule"]
-            level = rule.get("level", "info")
-            message = rule.get("message", "")
-            if level and message:
-                render_message(level, message)
+        level, message = evaluate_rules(tool, preview_values)
+        if level and message:
+            render_message(level, message)
 
         if tool.get("scoring_rules"):
             plus, minus, total = compute_scores(tool, preview_values)
