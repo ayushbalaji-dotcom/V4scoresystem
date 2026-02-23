@@ -1140,7 +1140,7 @@ def main():
         )
         tool["scoring_mode"] = scoring_mode
 
-                st.divider()
+        st.divider()
         st.subheader("Guideline Image")
         st.caption("Optional. This image will be shown at the bottom of the preview.")
 
