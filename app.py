@@ -726,6 +726,7 @@ def merge_ai_result(tool: Dict, parsed: Dict) -> Dict:
 
     return tool
 
+
 def tool_to_input_rows(tool):
     rows = []
     for item in tool.get("inputs", []):
@@ -1046,18 +1047,18 @@ def main():
         st.subheader("Tools")
         tool_items = st.session_state.tools_data.get("tools", {})
         tool_ids = list(tool_items.keys())
-        tool_labels = [tool_items[tool_id]["name"] for tool_id in tool_ids]
 
         if tool_ids:
             previous_selection = st.session_state.selected_tool_id
-            selected_label = st.selectbox(
+            selected_id = st.selectbox(
                 "Select tool",
-                options=tool_labels,
+                options=tool_ids,
                 index=tool_ids.index(st.session_state.selected_tool_id)
                 if st.session_state.selected_tool_id in tool_ids
                 else 0,
+                format_func=lambda tid: tool_items[tid].get("name", tid),
             )
-            st.session_state.selected_tool_id = tool_ids[tool_labels.index(selected_label)]
+            st.session_state.selected_tool_id = selected_id
             if st.session_state.selected_tool_id != previous_selection:
                 st.session_state.editing_tool = None
                 st.session_state.editing_tool_id = None
@@ -1142,14 +1143,8 @@ def main():
 
         st.divider()
         st.subheader("Guideline Image")
-        st.caption("Optional. This image will be shown at the bottom of the preview.")
-
-        image_upload = st.file_uploader(
-            "Upload guideline image",
-            type=["png", "jpg", "jpeg", "gif"],
-            key=f"guideline_image_{st.session_state.selected_tool_id}",
-        )
-
+        st.caption("Optional. This image will be shown at the bottom of the guideline table.")
+        image_upload = st.file_uploader("Upload guideline image", type=["png", "jpg", "jpeg", "gif"], key=f"guideline_image_{st.session_state.selected_tool_id}")
         if image_upload is not None:
             image_bytes = image_upload.getvalue()
             image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -1157,14 +1152,8 @@ def main():
             tool["guideline_image"] = f"data:{mime};base64,{image_b64}"
             st.session_state.editing_tool = tool
             st.success("Image attached to this tool.")
-
         if tool.get("guideline_image"):
             st.image(tool["guideline_image"], use_container_width=True)
-            if st.button("Remove guideline image"):
-                tool.pop("guideline_image", None)
-                st.session_state.editing_tool = tool
-                st.success("Guideline image removed.")
-                st.rerun()
 
         st.divider()
         st.subheader("Free-Text Rule Builder (AI)")
@@ -1625,6 +1614,11 @@ def main():
         if st.checkbox("Show decision tree", key="show_decision_tree"):
             id_to_label, _ = build_label_maps(tool.get("inputs", []))
             st.graphviz_chart(build_decision_tree_graph(tool, id_to_label))
+
+        if tool.get("guideline_image"):
+            st.divider()
+            st.subheader("Guideline Table Image")
+            st.image(tool["guideline_image"], use_container_width=True)
 
 
 if __name__ == "__main__":
